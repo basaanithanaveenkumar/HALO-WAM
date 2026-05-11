@@ -1,0 +1,59 @@
+# Bytecode & Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.tox
+.nox
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE & editor files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Project-specific unwanted files/folders
+checkpoints_old/
+halo_vla.egg-info/
+uv.lock
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
