@@ -6,11 +6,51 @@ from models.image_proj import ImageProjector
 from models.state_encoder import StateEncoder
 # --- Flow matching action decoder replaces MLP ActionDecoder ---
 from models.flow_action_decoder import FlowActionDecoder
+from models.dit_frame_prediction import VisualDiTPredictor
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.positional_embeddings import SinusoidalPositionalEmbedding
+
+def pool_past_frame_embeddings_for_visual_dit(
+    frame_stack: torch.Tensor,
+    image_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    Combine per-frame pooled ViT embeddings into one DiT conditioning vector per sample.
+
+    ``frame_stack`` holds one row per video frame (same order as ``images[:, i]``).
+    The **future** frame is the last *valid* slot per row; we average all **strictly
+    earlier** valid slots as "past context" (matches ``compute_visual_prediction_loss``).
+
+    Args:
+        frame_stack: [B, N, emb_dim] — typically ``proj_i.mean(dim=1)`` per frame.
+        image_mask:  [B, N] or longer; only ``[:, :N]`` is used. None = all frames valid.
+
+    Returns:
+        [B, emb_dim] — zero rows where there is no past (e.g. a single valid frame).
+    """
+    B, N, D = frame_stack.shape
+    device = frame_stack.device
+    dtype = frame_stack.dtype
+    if image_mask is not None:
+        mask = image_mask[:, :N].to(device=device, dtype=dtype)
+    else:
+        mask = torch.ones(B, N, device=device, dtype=dtype)
+
+    n_slots = mask.sum(dim=1).long()
+    rev = mask.long().flip(dims=[1])
+    from_end = rev.argmax(dim=1)
+    last_idx = (N - 1 - from_end).clamp(0, N - 1)
+    last_idx = torch.where(n_slots > 0, last_idx, torch.zeros_like(last_idx))
+
+    idx = torch.arange(N, device=device, dtype=dtype).view(1, N).expand(B, N)
+    past_mask = mask * (idx < last_idx.unsqueeze(1))
+    denom = past_mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
+    out = (frame_stack * past_mask.unsqueeze(-1)).sum(dim=1) / denom
+    zero_rows = (past_mask.sum(dim=1) < 1).unsqueeze(-1)
+    out = out.masked_fill(zero_rows, 0.0)
+    return out
 
 
 class HaloVLM(nn.Module):
@@ -67,9 +107,36 @@ class HaloVLM(nn.Module):
         self.action_chunk_size = network_config.action_chunk_size
         self.action_dim = network_config.action_dim
         self.flow_num_ode_steps = network_config.flow_num_ode_steps
-    
 
-    def forward(self, images, input_ids, attention_mask, states):
+        # --- DiT visual prediction (future RGB, depth, optical flow) ---
+        self.enable_visual_dit = getattr(network_config, "enable_visual_dit", True)
+        if self.enable_visual_dit:
+            self.visual_predictor = VisualDiTPredictor(network_config)
+        else:
+            self.visual_predictor = None
+
+    def encode_visual_context_from_past_vit(self, past_rgb: torch.Tensor) -> torch.Tensor:
+        """
+        Inference helper when no full ``forward`` is run: pool ViT + projector over
+        **past** frames only [B, emb_dim].
+
+        ``forward`` instead uses decoder hidden states at the same patch **positions**
+        (after blocks, before ``lm_head``); use the third return value of ``forward``
+        when training or when language context is available.
+        """
+        if past_rgb.dim() == 4:
+            x = past_rgb.unsqueeze(1)
+        else:
+            x = past_rgb
+        B, T, _, H, W = x.shape
+        pooled_frames: list[torch.Tensor] = []
+        for t in range(T):
+            feat = self.vis_enc(x[:, t])
+            proj = self.image_projector(feat)
+            pooled_frames.append(proj.mean(dim=1))
+        return torch.stack(pooled_frames, dim=1).mean(dim=1)
+
+    def forward(self, images, input_ids, attention_mask, states, image_mask=None):
         """
         Forward pass with interleaved multi-image, state-injection, and
         action-decoding support.
@@ -87,6 +154,9 @@ class HaloVLM(nn.Module):
             attention_mask: [B, seq_len]          — 1 for real tokens, 0 pad.
             states:         [B, N_state, state_dim] — proprioceptive states,
                             one per <state> token.
+            image_mask:     [B, N_img] optional — 1 for real image slots (padding 0).
+                            Used when pooling **past** frames for DiT conditioning from
+                            decoder states at image-patch positions (same order as ``images``).
 
         Returns:
             logits:         [B, total_len, vocab_size] — next-token logits.
@@ -94,6 +164,11 @@ class HaloVLM(nn.Module):
                             — transformer hidden states at <halo_action> positions,
                             used as conditioning for the flow matching decoder.
                             None if no <halo_action> tokens are present.
+            visual_context_emb: [B, emb_dim] or None — pooled **decoder** hidden states
+                            at the same image-patch positions (after transformer + final
+                            LayerNorm, before ``lm_head``): per-frame mean over patches,
+                            then mean over **past** valid frames (before the last valid).
+                            None if visual DiT is disabled.
         """
 
         B = input_ids.size(0)
@@ -119,6 +194,7 @@ class HaloVLM(nn.Module):
             all_img_proj.append(proj_i)
 
         img_proj = torch.cat(all_img_proj, dim=1)              # [B, N_img*num_patches, emb_dim]
+        num_prepended = img_proj.size(1)                       # image tokens before text
 
         # ------------------------------------------------------------------ #
         # 2. STATES — count <state> tokens, encode each state vector through
@@ -182,6 +258,17 @@ class HaloVLM(nn.Module):
         transformer_out = self.decoder_transformer(combined_embeds)
         transformer_out = self.layer_norm(transformer_out)
 
+        # --- Visual DiT conditioning: same **positions** as prepended image patches,
+        #     but **after** transformer blocks (and final LN), **before** lm_head.
+        visual_context_emb = None
+        if self.visual_predictor is not None and N_img >= 1 and num_prepended > 0:
+            patches_per_img = num_prepended // N_img
+            img_dec = transformer_out[:, :num_prepended, :]  # [B, N_img * P, D]
+            frame_stack = img_dec.view(B, N_img, patches_per_img, -1).mean(dim=2)
+            visual_context_emb = pool_past_frame_embeddings_for_visual_dit(
+                frame_stack, image_mask
+            )
+
         # ------------------------------------------------------------------ #
         # 8. LANGUAGE HEAD — project every position to vocab logits.
         #    logits → [B, total_len, vocab_size]
@@ -197,7 +284,6 @@ class HaloVLM(nn.Module):
         #    action_hiddens → [B, n_action_tokens, emb_dim]
         #    Returns None if no <halo_action> tokens are present.
         # ------------------------------------------------------------------ #
-        num_prepended = img_proj.size(1)  # N_img * num_patches
         action_mask = (input_ids == action_token_id)                # [B, seq_len]
         n_action_tokens = action_mask.sum(dim=1).max().item()  # scalar
 
@@ -233,7 +319,7 @@ class HaloVLM(nn.Module):
             import logging
             logging.warning("action_hiddens is None: No <halo_action> tokens found in input_ids.")
 
-        return logits, action_hiddens
+        return logits, action_hiddens, visual_context_emb
 
     # ------------------------------------------------------------------ #
     # Flow Matching — training loss
@@ -426,3 +512,93 @@ class HaloVLM(nn.Module):
         # so downstream code can interpret each timestep × DOF independently.
         action_preds = x.view(B, n_act, self.action_chunk_size, self.action_dim)
         return action_preds
+
+    # ------------------------------------------------------------------ #
+    # Visual DiT — conditional flow matching on frames (see dit_frame_prediction)
+    # ------------------------------------------------------------------ #
+    def compute_visual_prediction_loss(
+        self,
+        images: torch.Tensor,
+        image_mask: torch.Tensor | None = None,
+        visual_context_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Train the frame / depth / flow DiT heads on consecutive frames.
+
+        When ``visual_context_emb`` is provided (typically the third return of
+        ``forward``), each sample's DiT conditioning is that row — pooled **decoder**
+        hidden states at image-patch positions over **past** frames only (post-transformer,
+        pre-``lm_head``).
+
+        Args:
+            images:      [B, N, 3, H, W]
+            image_mask:  [B, N] optional — 1 for real slots; uses last two *valid* frames.
+            visual_context_emb: [B, emb_dim] optional — from ``forward`` (decoder image
+                            tokens); if None, falls back to the internal CNN
+                            ``FrameContextEncoder`` in the DiT module.
+
+        Returns:
+            Scalar loss (0 if heads disabled or no sample has ≥2 valid frames).
+        """
+        if self.visual_predictor is None:
+            return torch.tensor(0.0, device=images.device)
+
+        B, N, _, _, _ = images.shape
+        device = images.device
+        losses: list[torch.Tensor] = []
+
+        for b in range(B):
+            if image_mask is not None:
+                n_valid = int(image_mask[b].sum().item())
+                if n_valid < 2:
+                    continue
+                past = images[b : b + 1, : n_valid - 1]
+                future = images[b : b + 1, n_valid - 1]
+            else:
+                if N < 2:
+                    continue
+                past = images[b : b + 1, :-1]
+                future = images[b : b + 1, -1]
+
+            ctx_b = None
+            if visual_context_emb is not None:
+                ctx_b = visual_context_emb[b : b + 1]
+
+            out = self.visual_predictor.compute_losses(
+                past, future, context_emb=ctx_b
+            )
+            losses.append(out["loss_visual_total"])
+
+        if not losses:
+            return torch.tensor(0.0, device=device)
+        return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def predict_visual_future(
+        self,
+        past_rgb: torch.Tensor,
+        visual_context_emb: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Sample future RGB, depth, and optical flow from the DiT heads.
+
+        Args:
+            past_rgb: [B, T, 3, H, W] or [B, 3, H, W]
+            visual_context_emb: [B, emb_dim] — if None, computed here with the same
+                ViT + projector as ``forward`` (mean over ``past_rgb`` time).
+
+        Returns:
+            dict with keys ``rgb``, ``depth``, ``flow`` — each a batch of tensors,
+            or an empty dict if ``enable_visual_dit`` is False.
+        """
+        if self.visual_predictor is None:
+            return {}
+        H, W = past_rgb.shape[-2], past_rgb.shape[-1]
+        vp = self.visual_predictor
+        if visual_context_emb is None:
+            visual_context_emb = self.encode_visual_context_from_past_vit(past_rgb)
+        return {
+            "rgb": vp.predict_future_rgb(past_rgb, H, W, visual_context_emb),
+            "depth": vp.predict_future_depth(past_rgb, H, W, visual_context_emb),
+            "flow": vp.predict_optical_flow(past_rgb, H, W, visual_context_emb),
+        }

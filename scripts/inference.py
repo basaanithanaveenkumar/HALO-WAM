@@ -52,7 +52,14 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     # Recover config stored alongside weights
     config = ckpt.get("config", HaloVLMConfig())
     model = HaloVLM(config=config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    miss, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if miss:
+        logger.warning(
+            "Strict load skipped: {} missing keys (e.g. new visual DiT head)",
+            len(miss),
+        )
+    if unexpected:
+        logger.warning("{} unexpected keys dropped from checkpoint", len(unexpected))
     model.eval()
 
     logger.info(
@@ -126,7 +133,7 @@ def generate(
         eos_token_id = tokenizer.eos_token_id
 
     for _ in range(max_new_tokens):
-        logits, action_hiddens = model(
+        logits, action_hiddens, _ = model(
             images=images,
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -313,7 +320,7 @@ def evaluate_dataset(args):
         action_mask = batch["action_mask"].to(device)
         states = batch["states"].to(device)
 
-        logits, action_hiddens = model(
+        logits, action_hiddens, _ = model(
             images=images,
             input_ids=input_ids,
             attention_mask=attention_mask,

@@ -57,3 +57,19 @@ uv.lock
 *.log
 *.tmp
 *.bak
+
+# Directories
+checkpoints/
+runs/
+dataset_downloader/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log

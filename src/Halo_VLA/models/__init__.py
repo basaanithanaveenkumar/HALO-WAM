@@ -13,6 +13,8 @@ from .vit import VisTransformer
 from .lm_head import LMHead
 from .action_decoder import ActionDecoder
 from .state_encoder import StateEncoder
+from .DiT import DiT, DiTBlock, ScalarTimestepEmbedder
+from .dit_frame_prediction import VisualDiTPredictor, make_dit_config
 
 __all__ = [
     "HaloVLM",
@@ -21,4 +23,9 @@ __all__ = [
     "LMHead",
     "ActionDecoder",
     "StateEncoder",
+    "DiT",
+    "DiTBlock",
+    "ScalarTimestepEmbedder",
+    "VisualDiTPredictor",
+    "make_dit_config",
 ]

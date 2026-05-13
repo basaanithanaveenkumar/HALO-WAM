@@ -71,6 +71,28 @@ class HaloVLMConfig:
     flow_time_embed_dim: int = 128       # dim of sinusoidal time embedding
     flow_num_ode_steps: int = 20         # Euler integration steps at inference
 
+    # DiT visual heads (frame / depth / flow) — used by models.dit_frame_prediction
+    dit_in_channels: int = 3               # default RGB; overridden per head when needed
+    dit_out_channels: int = 3                # velocity has same layout as x (flow matching)
+    dit_time_freq_dim: int = 256         # sinusoidal timestep embedding size before MLP
+    dit_patch_size: int = 8
+    dit_hidden_size: int = 256
+    dit_depth: int = 6
+    dit_num_heads: int = 8
+    dit_mlp_ratio: float = 4.0
+    dit_max_resolution: int = 32         # max tokens per side (covers 224÷8 = 28)
+    dit_rgb_in_channels: int = 3           # convenience mirrors for make_dit_config
+    dit_depth_in_channels: int = 1
+    dit_flow_in_channels: int = 2
+    dit_flow_smooth_weight: float = 0.1  # optical-flow edge-aware smoothness
+    dit_depth_recon_weight: float = 0.5  # depth CFM + decoder RGB reconstruction
+    dit_flow_photo_weight: float = 0.5  # photometric term on flow estimate
+    dit_num_sample_steps: int = 20       # Euler steps for sampling at inference
+
+    # HaloVLM integration: DiT RGB / depth / flow heads (``VisualDiTPredictor``)
+    enable_visual_dit: bool = True      # False → omit heads (e.g. old checkpoints)
+    visual_loss_weight: float = 0.2      # added to train.py total loss
+
     # System prompt
     system_prompt: str = (
         "You are a robotic VLA assistant. Given images and states, "

@@ -74,7 +74,13 @@ def load_model(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = ckpt.get("config", HaloVLMConfig())
     model = HaloVLM(config=config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    miss, _ = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if miss:
+        logger.warning(
+            "{} missing keys after load (random init), e.g. {}",
+            len(miss),
+            miss[:5],
+        )
     model.eval()
     logger.info(
         "Loaded checkpoint {}  (epoch {})", ckpt_path, ckpt.get("epoch", -1)
@@ -91,7 +97,7 @@ def generate_text(model, tokenizer, images, input_ids, attention_mask, states,
     original_len = input_ids.size(1)  # save to decode only new tokens
 
     for _ in range(max_new_tokens):
-        logits, action_hiddens = model(
+        logits, action_hiddens, _ = model(
             images=images, input_ids=input_ids,
             attention_mask=attention_mask, states=states,
         )

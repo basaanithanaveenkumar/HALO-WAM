@@ -9,6 +9,7 @@ Usage:
 import argparse
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -27,6 +28,7 @@ sys.path.insert(0, str(ROOT / "src" / "Halo_VLA"))
 from config import HaloVLMConfig
 from models.halo_vla import HaloVLM
 from dataloader.eo_dataset import build_eo_dataloader
+from dataloader.airoa_moma_dataset import build_airoa_moma_dataloader
 from utils import log_module_parameters
 from scripts.visualize import (
     create_video,
@@ -35,6 +37,11 @@ from scripts.visualize import (
 )
 
 from loguru import logger
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None  # type: ignore[misc, assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -251,24 +258,47 @@ def train(args):
         state_dim=args.state_dim,
         action_chunk_size=args.action_chunk_size,
     )
+    if args.visual_loss_weight is not None:
+        config.visual_loss_weight = args.visual_loss_weight
+    visual_loss_weight = config.visual_loss_weight
 
     # ---- Model ----
     model = HaloVLM(config=config).to(device)
     log_module_parameters(model, model_name="HaloVLM", logger_fn=logger)
 
     # ---- Dataloader ----
-    train_loader = build_eo_dataloader(
-        subset=args.subset,
-        split="train",
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        img_size=config.img_size,
-        max_seq_len=args.max_seq_len,
-        action_dim=args.action_dim,
-        state_dim=args.state_dim,
-        shuffle=True,
-        max_samples=args.max_samples,
-    )
+    if args.dataset == "eo":
+        train_loader = build_eo_dataloader(
+            subset=args.subset,
+            split="train",
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            img_size=config.img_size,
+            max_seq_len=args.max_seq_len,
+            action_dim=args.action_dim,
+            state_dim=args.state_dim,
+            shuffle=True,
+            max_samples=args.max_samples,
+        )
+    else:
+        if not args.moma_data_root:
+            raise ValueError("--moma_data_root is required when --dataset moma")
+        moma_workers = args.moma_num_workers
+        train_loader = build_airoa_moma_dataloader(
+            data_root=args.moma_data_root,
+            batch_size=args.batch_size,
+            num_workers=moma_workers,
+            img_size=config.img_size,
+            max_seq_len=args.max_seq_len,
+            max_action_len=args.moma_max_action_len,
+            action_dim=args.action_dim,
+            state_dim=args.state_dim,
+            num_sample_frames=args.moma_num_frames,
+            frame_stride=args.moma_frame_stride,
+            camera=args.moma_camera,
+            shuffle=True,
+            max_samples=args.max_samples,
+        )
     logger.info("Dataset size: {}  |  Batches: {}", len(train_loader.dataset), len(train_loader))
 
     # ---- Grab tokenizer from dataset for debug decoding ----
@@ -282,6 +312,22 @@ def train(args):
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- TensorBoard ----
+    tb_writer = None
+    if args.tensorboard_dir:
+        if SummaryWriter is None:
+            logger.warning(
+                "tensorboard package missing; install with: pip install tensorboard"
+            )
+        else:
+            tb_root = Path(args.tensorboard_dir)
+            if args.tb_run_name:
+                tb_root = tb_root / args.tb_run_name
+            else:
+                tb_root = tb_root / datetime.now().strftime("%Y%m%d_%H%M%S")
+            tb_writer = SummaryWriter(log_dir=str(tb_root))
+            logger.info("TensorBoard log dir: {}  (tensorboard --logdir {})", tb_root, tb_root.parent)
+
     # ---- Training ----
     model.train()
     global_step = 0
@@ -289,6 +335,7 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         epoch_lang_loss = 0.0
         epoch_act_loss = 0.0
+        epoch_vis_loss = 0.0
         epoch_total_loss = 0.0
         t0 = time.time()
 
@@ -324,11 +371,12 @@ def train(args):
 
             # Forward  — returns (logits, action_hiddens)
             # action_hiddens: [B, n_act, emb_dim] conditioning for flow decoder
-            logits, action_hiddens = model(
+            logits, action_hiddens, visual_context_emb = model(
                 images=images,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 states=states,
+                image_mask=batch.get("image_mask"),
             )
 
             # Number of prepended image-patch tokens (for loss alignment)
@@ -340,7 +388,14 @@ def train(args):
             lang_loss = compute_language_loss(logits, labels, num_prepended)
             # Flow matching loss — replaces MLP action MSE loss
             act_loss = model.compute_flow_loss(action_hiddens, actions, action_mask)
-            total_loss = lang_loss + args.action_loss_weight * act_loss
+            vis_loss = model.compute_visual_prediction_loss(
+                images, batch.get("image_mask"), visual_context_emb,
+            )
+            total_loss = (
+                lang_loss
+                + args.action_loss_weight * act_loss
+                + visual_loss_weight * vis_loss
+            )
 
             # Backward
             optimizer.zero_grad()
@@ -353,16 +408,34 @@ def train(args):
             global_step += 1
             epoch_lang_loss += lang_loss.item()
             epoch_act_loss += act_loss.item()
+            epoch_vis_loss += vis_loss.item()
             epoch_total_loss += total_loss.item()
 
             # Logging
             if step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 logger.info(
-                    "Epoch {} | Step {}/{} | lang={:.4f}  act={:.4f}  total={:.4f} | lr={:.2e}",
+                    "Epoch {} | Step {}/{} | lang={:.4f}  act={:.4f}  vis={:.4f}  total={:.4f} | lr={:.2e}",
                     epoch, step, len(train_loader),
-                    lang_loss.item(), act_loss.item(), total_loss.item(), lr,
+                    lang_loss.item(), act_loss.item(), vis_loss.item(), total_loss.item(), lr,
                 )
+
+            if tb_writer is not None:
+                lr = optimizer.param_groups[0]["lr"]
+                tb_writer.add_scalar("loss/lang", lang_loss.item(), global_step)
+                tb_writer.add_scalar("loss/action_flow", act_loss.item(), global_step)
+                tb_writer.add_scalar("loss/visual_dit", vis_loss.item(), global_step)
+                tb_writer.add_scalar("loss/total", total_loss.item(), global_step)
+                tb_writer.add_scalar("optim/lr", lr, global_step)
+                tb_writer.add_scalar("epoch", epoch, global_step)
+
+                if args.tb_image_every > 0 and global_step % args.tb_image_every == 0:
+                    # First sample in batch: strip of frames [N,3,H,W] in [0,1] for TB
+                    grid = images[0, : min(8, images.size(1))].detach().cpu()
+                    grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
+                    tb_writer.add_images(
+                        "train/input_frames", grid, global_step, dataformats="NCHW"
+                    )
 
             # Visualisation videos
             if args.vis_every > 0 and global_step % args.vis_every == 0:
@@ -383,10 +456,16 @@ def train(args):
         n = len(train_loader)
         elapsed = time.time() - t0
         logger.info(
-            "=== Epoch {} done in {:.1f}s | avg lang={:.4f}  act={:.4f}  total={:.4f} ===",
+            "=== Epoch {} done in {:.1f}s | avg lang={:.4f}  act={:.4f}  vis={:.4f}  total={:.4f} ===",
             epoch, elapsed,
-            epoch_lang_loss / n, epoch_act_loss / n, epoch_total_loss / n,
+            epoch_lang_loss / n, epoch_act_loss / n, epoch_vis_loss / n, epoch_total_loss / n,
         )
+
+        if tb_writer is not None:
+            tb_writer.add_scalar("epoch_avg/lang", epoch_lang_loss / n, epoch)
+            tb_writer.add_scalar("epoch_avg/action_flow", epoch_act_loss / n, epoch)
+            tb_writer.add_scalar("epoch_avg/visual_dit", epoch_vis_loss / n, epoch)
+            tb_writer.add_scalar("epoch_avg/total", epoch_total_loss / n, epoch)
 
         # Save checkpoint
         if epoch % args.save_every == 0 or epoch == args.epochs:
@@ -405,6 +484,10 @@ def train(args):
             logger.info("Saved checkpoint → {}", ckpt_path)
 
     logger.info("Training complete.")
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()
+        logger.info("TensorBoard writer closed.")
 
 
 # ---------------------------------------------------------------------------
@@ -414,8 +497,34 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train Halo-VLA")
 
     # Data
+    p.add_argument(
+        "--dataset",
+        choices=("eo", "moma"),
+        default="eo",
+        help="eo: EO-Data1.5M; moma: local AIRoA MoMa clone (see dataloader/airoa_moma_dataset.py)",
+    )
+    p.add_argument(
+        "--moma_data_root",
+        default=None,
+        help="Path to local airoa-moma clone (episodes.jsonl + videos/). Required for --dataset moma.",
+    )
+    p.add_argument("--moma_camera", default="hand", choices=("hand", "head"))
+    p.add_argument(
+        "--moma_num_frames",
+        type=int,
+        default=8,
+        help="Temporal frames per sample (>=2 enables future-frame DiT loss)",
+    )
+    p.add_argument("--moma_frame_stride", type=int, default=4)
+    p.add_argument("--moma_max_action_len", type=int, default=256)
+    p.add_argument(
+        "--moma_num_workers",
+        type=int,
+        default=0,
+        help="Video decoding is safest with 0 workers; increase if you use a thread-safe backend",
+    )
     p.add_argument("--subset", default="interleave-temporal")
-    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--action_dim", type=int, default=32)
@@ -430,6 +539,12 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--action_loss_weight", type=float, default=1.0)
+    p.add_argument(
+        "--visual_loss_weight",
+        type=float,
+        default=None,
+        help="Weight for DiT frame/depth/flow loss (default: config.visual_loss_weight)",
+    )
 
     # Device
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -438,6 +553,24 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--save_every", type=int, default=1)
     p.add_argument("--ckpt_dir", default="checkpoints")
+    p.add_argument(
+        "--tensorboard_dir",
+        type=str,
+        default="runs",
+        help="TensorBoard root; logs go under runs/<timestamp>/ unless --tb_run_name is set. Empty string disables.",
+    )
+    p.add_argument(
+        "--tb_run_name",
+        type=str,
+        default="",
+        help="Subfolder under tensorboard_dir (default: timestamp)",
+    )
+    p.add_argument(
+        "--tb_image_every",
+        type=int,
+        default=0,
+        help="Log input frame strip every N steps (0 = off; increases log size)",
+    )
 
     # Visualisation during training
     p.add_argument("--vis_every", type=int, default=100,
