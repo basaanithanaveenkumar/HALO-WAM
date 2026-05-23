@@ -533,9 +533,8 @@ class HaloVLM(nn.Module):
         Args:
             images:      [B, N, 3, H, W]
             image_mask:  [B, N] optional — 1 for real slots; uses last two *valid* frames.
-            visual_context_emb: [B, emb_dim] optional — from ``forward`` (decoder image
-                            tokens); if None, falls back to the internal CNN
-                            ``FrameContextEncoder`` in the DiT module.
+            visual_context_emb: [B, emb_dim] — from ``forward`` (decoder image
+                            tokens); required.
 
         Returns:
             Scalar loss (0 if heads disabled or no sample has ≥2 valid frames).
@@ -543,31 +542,32 @@ class HaloVLM(nn.Module):
         if self.visual_predictor is None:
             return torch.tensor(0.0, device=images.device)
 
+        if visual_context_emb is None:
+            raise ValueError(
+                "visual_context_emb is mandatory in compute_visual_prediction_loss when visual DiT is enabled."
+            )
+
         B, N, _, _, _ = images.shape
         device = images.device
         losses: list[torch.Tensor] = []
 
         for b in range(B):
-            if image_mask is not None:
-                n_valid = int(image_mask[b].sum().item())
-                if n_valid < 2:
-                    continue
-                past = images[b : b + 1, : n_valid - 1]
-                future = images[b : b + 1, n_valid - 1]
-            else:
-                if N < 2:
-                    continue
-                past = images[b : b + 1, :-1]
-                future = images[b : b + 1, -1]
+            n_frames = int(image_mask[b].sum().item()) if image_mask is not None else N
+            if n_frames < 2:
+                continue
 
-            ctx_b = None
-            if visual_context_emb is not None:
-                ctx_b = visual_context_emb[b : b + 1]
+            num_future = min(3, n_frames - 1)
+            ctx_b = visual_context_emb[b : b + 1]
 
-            out = self.visual_predictor.compute_losses(
-                past, future, context_emb=ctx_b
-            )
-            losses.append(out["loss_visual_total"])
+            for step in range(num_future):
+                future_idx = n_frames - 1 - step
+                past = images[b : b + 1, :future_idx]
+                future = images[b : b + 1, future_idx]
+
+                out = self.visual_predictor.compute_losses(
+                    past, future, ctx_b, compute_rgb=True, compute_depth=False, compute_flow=False
+                )
+                losses.append(out["loss_visual_total"])
 
         if not losses:
             return torch.tensor(0.0, device=device)
@@ -578,27 +578,42 @@ class HaloVLM(nn.Module):
         self,
         past_rgb: torch.Tensor,
         visual_context_emb: torch.Tensor | None = None,
+        num_frames: int = 3,
     ) -> dict[str, torch.Tensor]:
         """
-        Sample future RGB, depth, and optical flow from the DiT heads.
+        Sample future RGB frames from the DiT heads autoregressively.
 
         Args:
             past_rgb: [B, T, 3, H, W] or [B, 3, H, W]
             visual_context_emb: [B, emb_dim] — if None, computed here with the same
                 ViT + projector as ``forward`` (mean over ``past_rgb`` time).
+            num_frames: int — number of future frames to predict (default: 3)
 
         Returns:
-            dict with keys ``rgb``, ``depth``, ``flow`` — each a batch of tensors,
+            dict with key ``rgb`` — a batch of tensors of shape [B, num_frames, 3, H, W],
             or an empty dict if ``enable_visual_dit`` is False.
         """
         if self.visual_predictor is None:
             return {}
         H, W = past_rgb.shape[-2], past_rgb.shape[-1]
         vp = self.visual_predictor
-        if visual_context_emb is None:
-            visual_context_emb = self.encode_visual_context_from_past_vit(past_rgb)
+
+        current_past = past_rgb
+        preds_rgb = []
+
+        for step in range(num_frames):
+            if step > 0 or visual_context_emb is None:
+                ctx_emb = self.encode_visual_context_from_past_vit(current_past)
+            else:
+                ctx_emb = visual_context_emb
+
+            pred_frame = vp.predict_future_rgb(current_past, H, W, ctx_emb)  # [B, 3, H, W]
+            preds_rgb.append(pred_frame)
+
+            if current_past.dim() == 4:
+                current_past = current_past.unsqueeze(1)
+            current_past = torch.cat([current_past, pred_frame.unsqueeze(1)], dim=1)
+
         return {
-            "rgb": vp.predict_future_rgb(past_rgb, H, W, visual_context_emb),
-            "depth": vp.predict_future_depth(past_rgb, H, W, visual_context_emb),
-            "flow": vp.predict_optical_flow(past_rgb, H, W, visual_context_emb),
+            "rgb": torch.stack(preds_rgb, dim=1),  # [B, num_frames, 3, H, W]
         }

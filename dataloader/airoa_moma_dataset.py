@@ -607,7 +607,7 @@ def build_airoa_moma_dataloader(
     state_dim: int = 32,
     num_sample_frames: int = 8,
     frame_stride: int = 4,
-    camera: str = "hand",
+    camera: str = "head",
     split: str = "train",
     shuffle: bool = True,
     max_samples: Optional[int] = None,

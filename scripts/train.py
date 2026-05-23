@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # ---------------------------------------------------------------------------
@@ -102,12 +103,21 @@ def compute_action_loss(action_preds, action_targets, action_mask):
     loss = ((preds_flat - targets).abs() * mask).sum() / mask.sum() / dim
     return loss
 
+def draw_overlays(frame, question, gt_answer, pred_answer, gt_actions, pred_actions, frame_idx):
+    # Add question as title
+    cv2.putText(frame, f"Q: {question[:50]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+    cv2.putText(frame, f"GT: {gt_answer[:30]}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+    if pred_answer:
+        cv2.putText(frame, f"Pred: {pred_answer[:30]}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+    # Optionally plot action curves (requires drawing on a small region)
+    return frame
+
 
 # ---------------------------------------------------------------------------
 # Visualization helper (called during training every N steps)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def generate_training_videos(
+def generate_training_videos_gif(
     model,
     batch,
     tokenizer,
@@ -222,9 +232,22 @@ def generate_training_videos(
                 )
         except Exception as e:
             logger.warning("Vis generation failed for sample {}: {}", b, e)
+        # ---- Save as GIF instead of MP4 ----
+        import imageio
 
+        gif_path = vis_dir / f"sample_{b}_vla_step{global_step}.gif"
+        # Convert BGR frames to RGB and repeat each frame according to frame_hold
+        rgb_frames = []
+        for frame in bgr_frames:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            for _ in range(frame_hold):
+                rgb_frames.append(rgb)
+        # Write GIF (loop forever)
+        imageio.mimsave(str(gif_path), rgb_frames, fps=fps, loop=0)
+
+        written += 1
         # --- Create video ---
-        video_path = str(vis_dir / f"sample_{b}_step{global_step}.mp4")
+        video_path = str(vis_dir / f"sample_{b}_vla_step{global_step}.mp4")
         create_video(
             frames=bgr_frames,
             question=question,
@@ -236,15 +259,107 @@ def generate_training_videos(
             fps=fps,
             frame_hold=frame_hold,
         )
-        written += 1
 
     model.train()
     logger.info(
-        "Generated {} visualisation video(s) at step {} → {}",
+        "Generated {} visualisation gif at step {} → {}",
         written, global_step, vis_dir,
     )
 
+# -----------------------
+@torch.no_grad()
+def generate_training_videos_with_pred(
+    model, batch, tokenizer, config, device, output_dir, global_step, epoch,
+    max_videos=4, min_frames=3, canvas_w=640, canvas_h=480,
+    fps=2, frame_hold=2, img_mean=(0.485,0.456,0.406), img_std=(0.229,0.224,0.225),
+):
+    import cv2
+    import numpy as np
 
+    model.eval()
+    vis_dir = output_dir / f"vis_epoch{epoch}_step{global_step}"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    images = batch["images"].to(device)          # [B, N, 3, H, W]
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    states = batch["states"].to(device)
+    image_mask = batch.get("image_mask")
+    img_h, img_w = images.shape[-2:]
+
+    B = images.size(0)
+    written = 0
+
+    for b in range(B):
+        if written >= max_videos:
+            break
+        if image_mask is not None and int(image_mask[b].sum().item()) < min_frames:
+            continue
+
+        # ---- Run model to get conditioning ----
+        imgs_in = images[b:b+1]
+        ids_in = input_ids[b:b+1]
+        mask_in = attention_mask[b:b+1]
+        states_in = states[b:b+1]
+        img_mask_in = image_mask[b:b+1] if image_mask is not None else None
+
+        _, _, visual_context_emb = model(
+            images=imgs_in,
+            input_ids=ids_in,
+            attention_mask=mask_in,
+            states=states_in,
+            image_mask=img_mask_in,
+        )   # visual_context_emb: [1, L, D]
+
+        # ---- Generate predicted future RGB frame ----
+        if hasattr(model, 'visual_predictor'):
+            # The predictor expects conditioning of shape [B, emb_dim]
+            # We pool over the sequence length
+            cond = visual_context_emb   # [1, 512] – already pooled
+            pred_frame = model.visual_predictor.predict_future_rgb(
+                past_rgb=imgs_in,
+                height=img_h,
+                width=img_w,
+                context_emb=cond,
+            )  # shape: [1, 3, H, W]
+        else:
+            logger.warning("model has no visual_predictor; skipping generation")
+            continue
+
+        mean_t = torch.tensor(img_mean, device=pred_frame.device).view(1, 3, 1, 1)
+        std_t = torch.tensor(img_std, device=pred_frame.device).view(1, 3, 1, 1)
+        pred_denorm = pred_frame * std_t + mean_t
+        pred_denorm = torch.clamp(pred_denorm, 0, 1)
+
+        # Convert to BGR for OpenCV
+        pred_np = pred_denorm[0].cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
+        pred_np = (pred_np * 255).clip(0, 255).astype(np.uint8)
+        pred_bgr = cv2.cvtColor(pred_np, cv2.COLOR_RGB2BGR)
+        pred_bgr = cv2.resize(pred_bgr, (canvas_w, canvas_h))
+
+        import imageio
+
+        gif_path = vis_dir / f"sample_{b}_pred_step{global_step}.gif"
+        # Convert BGR frame to RGB for GIF
+        frame_rgb = cv2.cvtColor(pred_bgr, cv2.COLOR_BGR2RGB)
+        # Create a list repeating the same frame to form an animation
+        frames_rgb = [frame_rgb] * (frame_hold * 10)
+        imageio.mimsave(str(gif_path), frames_rgb, fps=fps, loop=0)
+
+        written += 1
+
+        # # ---- Write a short video (loop the single frame for visibility) ----
+        # pred_video_path = str(vis_dir / f"sample_{b}_pred_step{global_step}.mp4")
+        # fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        # out_vid = cv2.VideoWriter(pred_video_path, fourcc, fps, (canvas_w, canvas_h))
+        # for _ in range(frame_hold * 10):   # repeat frame to make a short clip
+        #     out_vid.write(pred_bgr)
+        # out_vid.release()
+
+        # written += 1
+
+    model.train()
+    logger.info("Saved predicted videos for {} samples in {}", written, vis_dir)
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -307,6 +422,7 @@ def train(args):
     # ---- Optimizer & scheduler ----
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader))
+    scaler = GradScaler() 
 
     # ---- Checkpoint dir ----
     ckpt_dir = Path(args.ckpt_dir)
@@ -371,39 +487,76 @@ def train(args):
 
             # Forward  — returns (logits, action_hiddens)
             # action_hiddens: [B, n_act, emb_dim] conditioning for flow decoder
-            logits, action_hiddens, visual_context_emb = model(
-                images=images,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                states=states,
-                image_mask=batch.get("image_mask"),
-            )
+            # logits, action_hiddens, visual_context_emb = model(
+            #     images=images,
+            #     input_ids=input_ids,
+            #     attention_mask=attention_mask,
+            #     states=states,
+            #     image_mask=batch.get("image_mask"),
+            # )
 
-            # Number of prepended image-patch tokens (for loss alignment)
-            num_images = (input_ids == config.image_token_id).sum(dim=1).max().item()
-            num_patches = (config.img_size // config.patch_size) ** 2
-            num_prepended = num_images * num_patches
+            # # Number of prepended image-patch tokens (for loss alignment)
+            # num_images = (input_ids == config.image_token_id).sum(dim=1).max().item()
+            # num_patches = (config.img_size // config.patch_size) ** 2
+            # num_prepended = num_images * num_patches
 
-            # Losses
-            lang_loss = compute_language_loss(logits, labels, num_prepended)
-            # Flow matching loss — replaces MLP action MSE loss
-            act_loss = model.compute_flow_loss(action_hiddens, actions, action_mask)
-            vis_loss = model.compute_visual_prediction_loss(
-                images, batch.get("image_mask"), visual_context_emb,
-            )
-            total_loss = (
-                lang_loss
-                + args.action_loss_weight * act_loss
-                + visual_loss_weight * vis_loss
-            )
+            # # Losses
+            # lang_loss = compute_language_loss(logits, labels, num_prepended)
+            # # Flow matching loss — replaces MLP action MSE loss
+            # act_loss = model.compute_flow_loss(action_hiddens, actions, action_mask)
+            # vis_loss = model.compute_visual_prediction_loss(
+            #     images, batch.get("image_mask"), visual_context_emb,
+            # )
+            # total_loss = (
+            #     lang_loss
+            #     + args.action_loss_weight * act_loss
+            #     + visual_loss_weight * vis_loss
+            # )
 
-            # Backward
+            # # Backward
+            # optimizer.zero_grad()
+            # total_loss.backward()
+            # if args.grad_clip > 0:
+            #     nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            # optimizer.step()
+            # scheduler.step()
+            # --- Mixed precision forward pass ---
+            with autocast():
+                logits, action_hiddens, visual_context_emb = model(
+                    images=images,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    states=states,
+                    image_mask=batch.get("image_mask"),
+                )
+
+                num_images = (input_ids == config.image_token_id).sum(dim=1).max().item()
+                num_patches = (config.img_size // config.patch_size) ** 2
+                num_prepended = num_images * num_patches
+
+                lang_loss = compute_language_loss(logits, labels, num_prepended)
+                act_loss = model.compute_flow_loss(action_hiddens, actions, action_mask)
+                vis_loss = model.compute_visual_prediction_loss(
+                    images, batch.get("image_mask"), visual_context_emb
+                )
+                total_loss = (
+                    lang_loss
+                    + args.action_loss_weight * act_loss
+                    + visual_loss_weight * vis_loss
+                )
+
+            # --- Backward with scaler ---
             optimizer.zero_grad()
-            total_loss.backward()
+            scaler.scale(total_loss).backward()
+
+            # Gradient clipping (must unscale first)
             if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            scheduler.step()
+
+            scaler.step(optimizer)
+            scaler.update()          # updates the scaler for next iteration
+            scheduler.step()         # step scheduler after optimizer step
 
             global_step += 1
             epoch_lang_loss += lang_loss.item()
@@ -439,7 +592,12 @@ def train(args):
 
             # Visualisation videos
             if args.vis_every > 0 and global_step % args.vis_every == 0:
-                generate_training_videos(
+                generate_training_videos_gif(
+                    model=model, batch=batch, tokenizer=tokenizer, config=config,
+                    device=device, output_dir=Path(args.ckpt_dir), global_step=global_step,
+                    epoch=epoch, max_videos=args.vis_max_videos, min_frames=args.vis_min_frames,
+                )
+                generate_training_videos_with_pred(
                     model=model,
                     batch=batch,
                     tokenizer=tokenizer,
@@ -451,6 +609,8 @@ def train(args):
                     max_videos=args.vis_max_videos,
                     min_frames=args.vis_min_frames,
                 )
+                
+
 
         # End of epoch summary
         n = len(train_loader)
@@ -512,10 +672,10 @@ def parse_args():
     p.add_argument(
         "--moma_num_frames",
         type=int,
-        default=8,
+        default=3,
         help="Temporal frames per sample (>=2 enables future-frame DiT loss)",
     )
-    p.add_argument("--moma_frame_stride", type=int, default=4)
+    p.add_argument("--moma_frame_stride", type=int, default=2)
     p.add_argument("--moma_max_action_len", type=int, default=256)
     p.add_argument(
         "--moma_num_workers",
@@ -525,8 +685,8 @@ def parse_args():
     )
     p.add_argument("--subset", default="interleave-temporal")
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--max_seq_len", type=int, default=512)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--max_seq_len", type=int, default=256)
     p.add_argument("--action_dim", type=int, default=32)
     p.add_argument("--state_dim", type=int, default=32)
     p.add_argument("--action_chunk_size", type=int, default=16)
@@ -573,7 +733,7 @@ def parse_args():
     )
 
     # Visualisation during training
-    p.add_argument("--vis_every", type=int, default=100,
+    p.add_argument("--vis_every", type=int, default=10,
                     help="Generate vis videos every N steps (0 = disabled)")
     p.add_argument("--vis_max_videos", type=int, default=4,
                     help="Max videos per visualisation round")

@@ -28,7 +28,7 @@ class HaloVLMConfig:
     img_size: int = 224
     patch_size: int = 16
     in_chans: int = 3
-    vit_num_layers: int = 4
+    vit_num_layers: int = 2
     vit_num_heads: int = 16
     vit_mlp_dim: int = 512
     vit_drop: float = 0.0
@@ -42,7 +42,7 @@ class HaloVLMConfig:
     # MoE (DeepseekMoE) — used inside each TransformerBlock
     use_moe: bool = True                  # False → standard MLP FFN
     moe_hid_scale: float = 1.2            # hidden dim = round(emb_dim * scale)
-    moe_num_routed_experts: int = 8
+    moe_num_routed_experts: int = 4
     moe_top_k: int = 2
     moe_num_shared_experts: int = 2
 
@@ -69,23 +69,29 @@ class HaloVLMConfig:
     # Flow matching action decoder
     flow_hidden_dim: int = 1024          # hidden dim in flow velocity network
     flow_time_embed_dim: int = 128       # dim of sinusoidal time embedding
-    flow_num_ode_steps: int = 20         # Euler integration steps at inference
+    flow_num_ode_steps: int = 10         # Euler integration steps at inference
 
     # DiT visual heads (frame / depth / flow) — used by models.dit_frame_prediction
     dit_in_channels: int = 3               # default RGB; overridden per head when needed
     dit_out_channels: int = 3                # velocity has same layout as x (flow matching)
+    
+    # Visual prediction channels
+    rgb_channels: int = 3
+    depth_channels: int = 1
+    flow_channels: int = 2
+
     dit_time_freq_dim: int = 256         # sinusoidal timestep embedding size before MLP
-    dit_patch_size: int = 8
+    dit_patch_size: int = 4
     dit_hidden_size: int = 256
-    dit_depth: int = 6
-    dit_num_heads: int = 8
+    dit_depth: int = 4
+    dit_num_heads: int = 4
     dit_mlp_ratio: float = 4.0
-    dit_max_resolution: int = 32         # max tokens per side (covers 224÷8 = 28)
+    dit_max_resolution: int = 256         # max tokens per side
     dit_rgb_in_channels: int = 3           # convenience mirrors for make_dit_config
     dit_depth_in_channels: int = 1
     dit_flow_in_channels: int = 2
     dit_flow_smooth_weight: float = 0.1  # optical-flow edge-aware smoothness
-    dit_depth_recon_weight: float = 0.5  # depth CFM + decoder RGB reconstruction
+    dit_depth_recon_weight: float = 1.0  # depth CFM + decoder RGB reconstruction
     dit_flow_photo_weight: float = 0.5  # photometric term on flow estimate
     dit_num_sample_steps: int = 20       # Euler steps for sampling at inference
 

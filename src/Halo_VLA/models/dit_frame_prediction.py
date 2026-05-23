@@ -53,51 +53,15 @@ def make_dit_config(
     return SimpleNamespace(
         dit_in_channels=in_channels,
         dit_out_channels=out_channels,
-        dit_patch_size=base_config.dit_patch_size,
-        dit_hidden_size=base_config.dit_hidden_size,
-        dit_depth=base_config.dit_depth,
-        dit_num_heads=base_config.dit_num_heads,
-        dit_mlp_ratio=base_config.dit_mlp_ratio,
-        dit_max_resolution=base_config.dit_max_resolution,
+        dit_patch_size=getattr(base_config, "dit_patch_size", getattr(base_config, "patch_size", 4)),
+        dit_hidden_size=getattr(base_config, "dit_hidden_size", getattr(base_config, "emb_dim", 768)),
+        dit_depth=getattr(base_config, "dit_depth", 12),
+        dit_num_heads=getattr(base_config, "dit_num_heads", 12),
+        dit_mlp_ratio=getattr(base_config, "dit_mlp_ratio", 4.0),
+        dit_max_resolution=getattr(base_config, "dit_max_resolution", 256),
         emb_dim=base_config.emb_dim,
         dit_time_freq_dim=getattr(base_config, "dit_time_freq_dim", 256),
     )
-
-
-class FrameContextEncoder(nn.Module):
-    """
-    Encode one or more past RGB frames into a single conditioning vector c ∈ ℝ^{emb_dim}.
-
-    The DiT uses the same conditioning interface as the rest of Halo-VLA (``emb_dim``).
-    """
-
-    def __init__(self, emb_dim: int = 512, in_ch: int = 3):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 64, kernel_size=7, stride=2, padding=3),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.fc = nn.Linear(256, emb_dim)
-
-    def forward(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        frames: [B, T, 3, H, W] or [B, 3, H, W]
-        returns: [B, emb_dim]
-        """
-        if frames.dim() == 5:
-            b, t, c, h, w = frames.shape
-            x = frames.reshape(b * t, c, h, w)
-            feat = self.net(x).flatten(1)
-            feat = feat.view(b, t, -1).mean(dim=1)
-            return self.fc(feat)
-        return self.fc(self.net(frames).flatten(1))
 
 
 class DepthToRgbDecoder(nn.Module):
@@ -233,7 +197,7 @@ def sample_di_t_euler(
 
 class VisualDiTPredictor(nn.Module):
     """
-    Three DiT heads (RGB future, depth future, optical flow) sharing one context encoder.
+    Three DiT heads (RGB future, depth future, optical flow).
 
     Use ``compute_losses`` during training and ``predict_*`` helpers at inference.
     """
@@ -241,47 +205,44 @@ class VisualDiTPredictor(nn.Module):
     def __init__(self, config: Any):
         super().__init__()
         self.config = config
-        self.context_encoder = FrameContextEncoder(emb_dim=config.emb_dim, in_ch=3)
-        self.dit_rgb = DiT(make_dit_config(config, config.dit_rgb_in_channels, config.dit_rgb_in_channels))
-        self.dit_depth = DiT(make_dit_config(config, config.dit_depth_in_channels, config.dit_depth_in_channels))
-        self.dit_flow = DiT(make_dit_config(config, config.dit_flow_in_channels, config.dit_flow_in_channels))
-        self.depth_to_rgb = DepthToRgbDecoder()
+        
+        rgb_ch = getattr(config, "rgb_channels", getattr(config, "dit_rgb_in_channels", 3))
+        depth_ch = getattr(config, "depth_channels", getattr(config, "dit_depth_in_channels", 1))
+        flow_ch = getattr(config, "flow_channels", getattr(config, "dit_flow_in_channels", 2))
 
-    def encode_context(self, past_rgb: torch.Tensor) -> torch.Tensor:
-        return self.context_encoder(past_rgb)
+        self.dit_rgb = DiT(make_dit_config(config, rgb_ch, rgb_ch))
+        self.dit_depth = DiT(make_dit_config(config, depth_ch, depth_ch))
+        self.dit_flow = DiT(make_dit_config(config, flow_ch, flow_ch))
+        self.depth_to_rgb = DepthToRgbDecoder()
 
     def compute_losses(
         self,
         past_rgb: torch.Tensor,
         future_rgb: torch.Tensor,
+        context_emb: torch.Tensor,
         *,
-        context_emb: Optional[torch.Tensor] = None,
         compute_rgb: bool = True,
-        compute_depth: bool = True,
-        compute_flow: bool = True,
+        compute_depth: bool = False,
+        compute_flow: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         past_rgb:   [B, T, 3, H, W] or [B, 3, H, W] — conditioning frames
         future_rgb: [B, 3, H, W] — the frame to predict (x_1 for RGB / derived targets)
-        context_emb: [B, emb_dim] — if set (e.g. ViT+pooled past from HaloVLM.forward),
-                     used as DiT conditioning instead of the internal CNN encoder.
+        context_emb: [B, emb_dim] — pooled decoder hidden states at image-patch positions
+                                    over past frames (required).
 
         Returns a dict of scalar losses suitable for backprop.
         """
-        if context_emb is not None:
-            ctx = context_emb
-        else:
-            ctx = self.encode_context(past_rgb)
         out: Dict[str, torch.Tensor] = {}
         cfg = self.config
 
         if compute_rgb:
-            loss_rgb, _, _, _ = flow_matching_velocity_loss(self.dit_rgb, future_rgb, ctx)
+            loss_rgb, _, _, _ = flow_matching_velocity_loss(self.dit_rgb, future_rgb, context_emb)
             out["loss_rgb_cfm"] = loss_rgb
 
         if compute_depth:
             d1 = rgb_to_pseudo_depth(future_rgb).detach()
-            loss_d, x_t, t, v_pred = flow_matching_velocity_loss(self.dit_depth, d1, ctx)
+            loss_d, x_t, t, v_pred = flow_matching_velocity_loss(self.dit_depth, d1, context_emb)
             out["loss_depth_cfm"] = loss_d
             d_hat = cfm_endpoint_estimate(x_t, v_pred, t)
             rgb_hat = self.depth_to_rgb(d_hat)
@@ -293,7 +254,7 @@ class VisualDiTPredictor(nn.Module):
             else:
                 i0 = past_rgb
             flow_star = gradient_flow_pseudo(i0, future_rgb).detach()
-            loss_f, x_tf, tf, vf = flow_matching_velocity_loss(self.dit_flow, flow_star, ctx)
+            loss_f, x_tf, tf, vf = flow_matching_velocity_loss(self.dit_flow, flow_star, context_emb)
             out["loss_flow_cfm"] = loss_f
             flow_hat = cfm_endpoint_estimate(x_tf, vf, tf)
             i_w = backward_warp(i0, flow_hat)
@@ -305,17 +266,20 @@ class VisualDiTPredictor(nn.Module):
         if compute_rgb:
             total = total + out["loss_rgb_cfm"]
         if compute_depth:
+            depth_recon_weight = getattr(cfg, "dit_depth_recon_weight", 0.5)
             total = (
                 total
                 + out["loss_depth_cfm"]
-                + cfg.dit_depth_recon_weight * out["loss_depth_recon"]
+                + depth_recon_weight * out["loss_depth_recon"]
             )
         if compute_flow:
+            flow_photo_weight = getattr(cfg, "dit_flow_photo_weight", 0.5)
+            flow_smooth_weight = getattr(cfg, "dit_flow_smooth_weight", 0.1)
             total = (
                 total
                 + out["loss_flow_cfm"]
-                + cfg.dit_flow_photo_weight * out["loss_flow_photo"]
-                + cfg.dit_flow_smooth_weight * out["loss_flow_smooth"]
+                + flow_photo_weight * out["loss_flow_photo"]
+                + flow_smooth_weight * out["loss_flow_smooth"]
             )
         out["loss_visual_total"] = total
         return out
@@ -326,16 +290,17 @@ class VisualDiTPredictor(nn.Module):
         past_rgb: torch.Tensor,
         height: int,
         width: int,
-        context_emb: Optional[torch.Tensor] = None,
+        context_emb: torch.Tensor,
     ) -> torch.Tensor:
-        ctx = context_emb if context_emb is not None else self.encode_context(past_rgb)
+        channels = getattr(self.config, "rgb_channels", getattr(self.config, "dit_rgb_in_channels", 3))
+        num_steps = getattr(self.config, "dit_num_sample_steps", 20)
         return sample_di_t_euler(
             self.dit_rgb,
-            ctx,
-            self.config.dit_rgb_in_channels,
+            context_emb,
+            channels,
             height,
             width,
-            num_steps=self.config.dit_num_sample_steps,
+            num_steps=num_steps,
         )
 
     @torch.no_grad()
@@ -344,16 +309,17 @@ class VisualDiTPredictor(nn.Module):
         past_rgb: torch.Tensor,
         height: int,
         width: int,
-        context_emb: Optional[torch.Tensor] = None,
+        context_emb: torch.Tensor,
     ) -> torch.Tensor:
-        ctx = context_emb if context_emb is not None else self.encode_context(past_rgb)
+        channels = getattr(self.config, "depth_channels", getattr(self.config, "dit_depth_in_channels", 1))
+        num_steps = getattr(self.config, "dit_num_sample_steps", 20)
         return sample_di_t_euler(
             self.dit_depth,
-            ctx,
-            self.config.dit_depth_in_channels,
+            context_emb,
+            channels,
             height,
             width,
-            num_steps=self.config.dit_num_sample_steps,
+            num_steps=num_steps,
         )
 
     @torch.no_grad()
@@ -362,14 +328,15 @@ class VisualDiTPredictor(nn.Module):
         past_rgb: torch.Tensor,
         height: int,
         width: int,
-        context_emb: Optional[torch.Tensor] = None,
+        context_emb: torch.Tensor,
     ) -> torch.Tensor:
-        ctx = context_emb if context_emb is not None else self.encode_context(past_rgb)
+        channels = getattr(self.config, "flow_channels", getattr(self.config, "dit_flow_in_channels", 2))
+        num_steps = getattr(self.config, "dit_num_sample_steps", 20)
         return sample_di_t_euler(
             self.dit_flow,
-            ctx,
-            self.config.dit_flow_in_channels,
+            context_emb,
+            channels,
             height,
             width,
-            num_steps=self.config.dit_num_sample_steps,
+            num_steps=num_steps,
         )

@@ -40,6 +40,7 @@ dependencies = [
     "av>=17.0.1",
     "setuptools>=82.0.0",
     "tensorboard>=2.20.0",
+    "imageio>=2.37.3",
 ]
 
 [project.optional-dependencies]
