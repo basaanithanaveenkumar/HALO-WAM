@@ -25,29 +25,6 @@ Halo-VLA is a single unified model that handles **language grounding**, **robot 
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           Halo-VLA                                  │
-│                                                                     │
-│  Images [B,N,3,H,W] ──► ViT encoder ──► patch embeddings           │
-│  State  [B,S,D_s]   ──► State MLP   ──► state embeddings           │
-│  Text tokens        ──► Factored embedding table                    │
-│           │                                                         │
-│           └──────► Decoder Transformer (MoE) ◄────────────────┐    │
-│                         8 layers · 16 heads                    │    │
-│                         DeepSeek MoE FFN                       │    │
-│                    ┌────────┬────────┬──────────┐              │    │
-│                    │        │        │          │              │    │
-│                 LM head  Action   Visual   World video         │    │
-│                 (text)   hiddens  context   query hiddens      │    │
-│                    │        │        │          │              │    │
-│                 Language  Flow    DiT RGB   (conditioning)     │    │
-│                  loss    Matching  head                        │    │
-│                          Decoder  (future                      │    │
-│                          (actions) frames)                     │    │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
 ### Key components
 
 | Module | What it does |
