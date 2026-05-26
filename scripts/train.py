@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # ---------------------------------------------------------------------------
@@ -32,9 +32,13 @@ from dataloader.eo_dataset import build_eo_dataloader
 from dataloader.airoa_moma_dataset import build_airoa_moma_dataloader
 from utils import log_module_parameters
 from scripts.visualize import (
-    create_video,
     unnormalise_image,
     generate_text,
+    get_font,
+    action_comparison_image,
+    sample_dit_with_intermediates,
+    save_diffusion_gif,
+    tensor_to_display_image,
 )
 
 from loguru import logger
@@ -43,6 +47,22 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None  # type: ignore[misc, assignment]
+
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None  # type: ignore[assignment]
+    _CV2_AVAILABLE = False
+
+try:
+    import imageio
+    _IMAGEIO_AVAILABLE = True
+except ImportError:
+    imageio = None  # type: ignore[assignment]
+    _IMAGEIO_AVAILABLE = False
+
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -104,20 +124,20 @@ def compute_action_loss(action_preds, action_targets, action_mask):
     return loss
 
 def draw_overlays(frame, question, gt_answer, pred_answer, gt_actions, pred_actions, frame_idx):
-    # Add question as title
-    cv2.putText(frame, f"Q: {question[:50]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-    cv2.putText(frame, f"GT: {gt_answer[:30]}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+    if not _CV2_AVAILABLE:
+        return frame
+    cv2.putText(frame, f"Q: {question[:50]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame, f"GT: {gt_answer[:30]}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
     if pred_answer:
-        cv2.putText(frame, f"Pred: {pred_answer[:30]}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
-    # Optionally plot action curves (requires drawing on a small region)
+        cv2.putText(frame, f"Pred: {pred_answer[:30]}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
     return frame
 
 
 # ---------------------------------------------------------------------------
-# Visualization helper (called during training every N steps)
+# Unified training visualization
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def generate_training_videos_gif(
+def generate_training_visualization(
     model,
     batch,
     tokenizer,
@@ -127,239 +147,490 @@ def generate_training_videos_gif(
     global_step: int,
     epoch: int,
     max_videos: int = 4,
-    min_frames: int = 3,
-    canvas_w: int = 640,
-    canvas_h: int = 480,
-    fps: int = 2,
+    min_frames: int = 2,
+    panel_w: int = 480,
+    panel_h: int = 320,
+    fps_ctx: int = 6,
+    fps_text: int = 8,
+    fps_future: int = 10,
     frame_hold: int = 2,
+    diffusion_steps: int = 30,
+    diffusion_snapshots: int = 24,
+    diffusion_fps: int = 12,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
 ):
     """
-    Generate visualisation videos for batch samples that have >= min_frames.
+    Training-time visualisation GIF — 2x2 panel layout with PIL-rendered text.
 
-    For each qualifying sample in the batch:
-      - Runs greedy generation to get predicted text + actions
-      - Creates an MP4 with frame slideshow, Q/A overlay, action chart
+        +------------------------------------------------------------------+
+        |  Task / GT / Pred (word-by-word reveal)  + correctness badge     |  <- header
+        +------------------------------+-----------------------------------+
+        |  Context frame  i / N        |  Action trajectory (GT vs Pred)   |
+        +------------------------------+-----------------------------------+
+        |  GT future frame  f / P      |  DiT predicted frame  f / P       |
+        +------------------------------+-----------------------------------+
+
+    Phases:
+      1. Context scroll    - top-left cycles through VLA input frames,
+                             held slowly so each frame is easy to read.
+      2. Autoregressive    - header Pred text revealed one word at a time.
+      3. Future reveal     - bottom row shows GT vs DiT predicted futures,
+                             action chart switches to GT + Pred overlay.
+
+    A separate noise->image GIF is also written per sample showing the DiT
+    diffusion process for the first predicted future frame.
     """
-    import cv2
+    if not _CV2_AVAILABLE or not _IMAGEIO_AVAILABLE:
+        logger.warning("cv2 or imageio not available; skipping visualization")
+        return
 
+    from PIL import Image as PILImage, ImageDraw as PILDraw
+
+    # ── layout ───────────────────────────────────────────────
+    HDR_H   = 88
+    PANEL_H = panel_h
+    PANEL_W = panel_w
+    COL_SEP = 4
+    ROW_SEP = 26
+    CW      = PANEL_W * 2 + COL_SEP
+    CH      = HDR_H + PANEL_H + ROW_SEP + PANEL_H
+
+    # RGB colour palette (PIL works in RGB; convert to BGR only at write time).
+    C_BG       = (14,  16,  28)
+    C_MID      = (22,  26,  44)
+    C_SEP      = (60,  68,  104)
+    C_TXT      = (220, 226, 240)
+    C_DIM      = (90,  98,  120)
+    C_WHT      = (255, 255, 255)
+    C_GRN      = (130, 235, 170)   # GT
+    C_CYN      = (255, 200, 110)   # prediction (amber)
+    C_ORG      = (150, 220, 255)   # task / accent blue
+    C_PINK     = (235, 130, 150)
+    C_ACCENT   = (96,  200, 255)
+
+    F_HEAD     = get_font(20, bold=True)
+    F_LABEL    = get_font(14, bold=True)
+    F_BODY     = get_font(15)
+    F_PANEL    = get_font(13, bold=True)
+    F_BAND     = get_font(13, bold=True)
+    F_BADGE    = get_font(12, bold=True)
+
+    def _new_canvas():
+        """Fresh RGB canvas with column/row dividers and a band label."""
+        canvas = PILImage.new("RGB", (CW, CH), C_BG)
+        d = PILDraw.Draw(canvas, "RGBA")
+
+        # Header strip with a soft horizontal gradient.
+        for x in range(CW):
+            t = x / max(CW - 1, 1)
+            r = int((1 - t) * 18 + t * C_ACCENT[0] * 0.40)
+            g = int((1 - t) * 24 + t * C_ACCENT[1] * 0.40)
+            b = int((1 - t) * 40 + t * C_ACCENT[2] * 0.50)
+            d.line([(x, 0), (x, HDR_H - 1)], fill=(r, g, b))
+        d.rectangle((0, 0, 5, HDR_H), fill=C_ACCENT + (255,))
+        d.line((0, HDR_H - 1, CW, HDR_H - 1), fill=C_SEP + (220,), width=1)
+
+        # Vertical column divider.
+        d.rectangle((PANEL_W, HDR_H, PANEL_W + COL_SEP, CH), fill=C_SEP)
+
+        # Row band between the action chart and the future-frame row.
+        hr = HDR_H + PANEL_H
+        d.rectangle((0, hr, CW, hr + ROW_SEP), fill=C_MID)
+        d.line((0, hr, CW, hr), fill=C_SEP, width=1)
+        d.line((0, hr + ROW_SEP - 1, CW, hr + ROW_SEP - 1),
+               fill=C_SEP, width=1)
+        band_label = "Future Frame Prediction"
+        bbox = d.textbbox((0, 0), band_label, font=F_BAND)
+        tw = bbox[2] - bbox[0]
+        d.text(((CW - tw) // 2, hr + (ROW_SEP - 16) // 2),
+               band_label, font=F_BAND, fill=C_CYN)
+        return canvas
+
+    def panel_origin(row, col):
+        x0 = col * (PANEL_W + COL_SEP)
+        y0 = HDR_H + row * (PANEL_H + ROW_SEP)
+        return x0, y0
+
+    def _wrap(text: str, max_chars: int) -> str:
+        if not text:
+            return ""
+        return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
+
+    def draw_header(canvas, task, gt, pred_partial, cursor=False,
+                    is_correct=None):
+        d = PILDraw.Draw(canvas, "RGBA")
+        max_c = max(20, (CW - 30) // 9)
+        tick = "|" if cursor else ""
+
+        # Three labelled rows, each with a bold tag and a value.
+        labels = [
+            ("TASK", _wrap(task, max_c), C_ORG),
+            ("GT",   _wrap(gt,   max_c), C_GRN),
+            ("PRED", _wrap(pred_partial + tick, max_c), C_CYN),
+        ]
+        y = 10
+        for tag, val, val_col in labels:
+            d.text((18, y + 1), tag, font=F_LABEL, fill=(0, 0, 0, 200))
+            d.text((17, y),     tag, font=F_LABEL, fill=C_WHT)
+            d.text((78, y + 1), val, font=F_BODY,  fill=(0, 0, 0, 200))
+            d.text((77, y),     val, font=F_BODY,  fill=val_col)
+            y += 22
+
+        # Correctness badge in the top-right.
+        if is_correct is not None:
+            label = "CORRECT" if is_correct else "WRONG"
+            badge_col = (60, 200, 120) if is_correct else (235, 90, 110)
+            bbox = d.textbbox((0, 0), label, font=F_BADGE)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            pad_x, pad_y = 10, 4
+            x1 = CW - 14
+            x0 = x1 - tw - pad_x * 2
+            y0 = 12
+            y1 = y0 + th + pad_y * 2
+            try:
+                d.rounded_rectangle((x0, y0, x1, y1), radius=10,
+                                    fill=badge_col + (235,))
+            except AttributeError:
+                d.rectangle((x0, y0, x1, y1), fill=badge_col + (235,))
+            d.text((x0 + pad_x, y0 + pad_y - 1), label, font=F_BADGE,
+                   fill=(255, 255, 255))
+
+    def place_image(canvas, img_bgr, row, col, label,
+                    color=C_WHT, border=None):
+        x0, y0 = panel_origin(row, col)
+        panel = cv2.resize(img_bgr, (PANEL_W, PANEL_H))
+        panel_rgb = cv2.cvtColor(panel, cv2.COLOR_BGR2RGB)
+        canvas.paste(PILImage.fromarray(panel_rgb), (x0, y0))
+
+        d = PILDraw.Draw(canvas, "RGBA")
+        if border:
+            d.rectangle((x0, y0, x0 + PANEL_W - 1, y0 + PANEL_H - 1),
+                        outline=border, width=2)
+        # Top label ribbon.
+        d.rectangle((x0, y0, x0 + PANEL_W, y0 + 24),
+                    fill=(0, 0, 0, 160))
+        d.text((x0 + 9, y0 + 5), label, font=F_PANEL, fill=color)
+
+    def place_chart(canvas, chart_bgr, row, col, label="", color=C_TXT):
+        x0, y0 = panel_origin(row, col)
+        resized = cv2.resize(chart_bgr, (PANEL_W, PANEL_H))
+        chart_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        canvas.paste(PILImage.fromarray(chart_rgb), (x0, y0))
+        if label:
+            d = PILDraw.Draw(canvas, "RGBA")
+            d.rectangle((x0, y0 + PANEL_H - 22, x0 + PANEL_W, y0 + PANEL_H),
+                        fill=(0, 0, 0, 160))
+            d.text((x0 + 9, y0 + PANEL_H - 18), label, font=F_PANEL,
+                   fill=color)
+
+    def place_placeholder(canvas, row, col, label):
+        x0, y0 = panel_origin(row, col)
+        d = PILDraw.Draw(canvas, "RGBA")
+        d.rectangle((x0, y0, x0 + PANEL_W, y0 + PANEL_H), fill=C_BG)
+        # Hatched pattern.
+        for offset in range(0, PANEL_W + PANEL_H, 14):
+            d.line((x0 + offset, y0, x0, y0 + offset),
+                   fill=(28, 32, 50), width=1)
+        bbox = d.textbbox((0, 0), label, font=F_LABEL)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        d.text(((x0 + (PANEL_W - tw) // 2), y0 + (PANEL_H - th) // 2),
+               label, font=F_LABEL, fill=C_DIM)
+
+    def render_action_chart(gt_arr, pred_arr, reveal_up_to=None):
+        """Use the polished shared chart renderer from visualize.py."""
+        if gt_arr is None and pred_arr is None:
+            return np.full((PANEL_H, PANEL_W, 3), (28, 32, 50), dtype=np.uint8)
+        if gt_arr is None:
+            # action_comparison_image expects a GT array; substitute zeros.
+            gt_arr = np.zeros_like(pred_arr)
+        return action_comparison_image(
+            pred=pred_arr, gt=gt_arr,
+            width=PANEL_W, height=PANEL_H,
+            reveal_up_to=reveal_up_to,
+            phase_label="Action Trajectory",
+        )
+
+    def to_rgb_array(canvas):
+        return np.asarray(canvas.convert("RGB"))
+
+    # ── load batch ───────────────────────────────────────────
     model.eval()
     vis_dir = output_dir / f"vis_epoch{epoch}_step{global_step}"
     vis_dir.mkdir(parents=True, exist_ok=True)
 
-    images = batch["images"].to(device)               # [B, N, 3, H, W]
-    input_ids = batch["input_ids"].to(device)           # [B, seq_len]
+    images         = batch["images"].to(device)
+    input_ids_full = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
-    labels = batch["labels"].to(device)
-    actions = batch["actions"]                          # [B, T, act_dim]
-    action_mask_b = batch["action_mask"]                # [B, T]
-    states = batch["states"].to(device)                 # [B, S, state_dim]
-    image_mask = batch.get("image_mask")                # [B, N] or None
+    states         = batch["states"].to(device)
+    image_mask     = batch.get("image_mask")
+    gt_future      = batch.get("future_frames")
+    if gt_future is not None:
+        gt_future = gt_future.to(device)
 
-    B = images.size(0)
+    has_predictor   = hasattr(model, "visual_predictor") and model.visual_predictor is not None
+    num_predict_cap = getattr(model.visual_predictor, "num_predict_frames", 1) if has_predictor else 0
+
+    B       = images.size(0)
     written = 0
 
     for b in range(B):
         if written >= max_videos:
             break
-
-        # Count real images for this sample
-        if image_mask is not None:
-            n_imgs = int(image_mask[b].sum().item())
-        else:
-            n_imgs = images.size(1)
-
+        n_imgs = int(image_mask[b].sum().item()) if image_mask is not None else images.size(1)
         if n_imgs < min_frames:
             continue
 
-        # --- Decode GT question / answer from input_ids + labels ---
-        ids_b = input_ids[b].cpu()
-        full_decoded = tokenizer.decode(ids_b, skip_special_tokens=False)
+        # ── decode GT text ───────────────────────────────────
+        full_seq = tokenizer.decode(input_ids_full[b].cpu(), skip_special_tokens=False)
+        task_text, gt_answer = "", ""
+        if "<|im_start|>user" in full_seq:
+            blk = full_seq.split("<|im_start|>user")[-1]
+            task_text = blk.split("<|im_end|>")[0].strip() if "<|im_end|>" in blk else blk.strip()
+        if "<|im_start|>assistant" in full_seq:
+            blk = full_seq.split("<|im_start|>assistant")[-1]
+            gt_answer = blk.split("<|im_end|>")[0].strip() if "<|im_end|>" in blk else blk.strip()
+        for tok in ("<image>", "<state>", "<halo_action>", "<halo_world_video>"):
+            task_text = task_text.replace(tok, "").strip()
+            gt_answer = gt_answer.replace(tok, "").strip()
+        if "Task:" in task_text:
+            task_text = task_text.split("Task:")[-1].split("\n")[0].strip()
+        task_text = task_text[:90]
+        gt_answer = gt_answer[:90]
 
-        # Extract question (user turn) and GT answer (assistant turn)
-        question, gt_answer = "", ""
-        if "<|im_start|>user" in full_decoded:
-            user_block = full_decoded.split("<|im_start|>user")[-1]
-            if "<|im_end|>" in user_block:
-                question = user_block.split("<|im_end|>")[0].strip()
-        if "<|im_start|>assistant" in full_decoded:
-            asst_block = full_decoded.split("<|im_start|>assistant")[-1]
-            if "<|im_end|>" in asst_block:
-                gt_answer = asst_block.split("<|im_end|>")[0].strip()
-            else:
-                gt_answer = asst_block.strip()
+        # ── build prompt-only ids (strip completed assistant turn) ──
+        asst_prefix = "<|im_start|>assistant\n"
+        cut = full_seq.rfind(asst_prefix)
+        if cut != -1:
+            enc     = tokenizer(full_seq[: cut + len(asst_prefix)],
+                                return_tensors="pt", add_special_tokens=False)
+            ids_in  = enc["input_ids"].to(device)
+            mask_in = enc["attention_mask"].to(device)
+        else:
+            ids_in  = input_ids_full[b : b + 1]
+            mask_in = attention_mask[b : b + 1]
 
-        # Clean up special tokens from question text
-        for tok in ["<image>", "<state>", "<halo_action>"]:
-            question = question.replace(tok, "").strip()
+        imgs_in     = images[b : b + 1]
+        states_in   = states[b : b + 1]
+        img_mask_in = image_mask[b : b + 1] if image_mask is not None else None
 
-        # --- Convert images to BGR frames ---
-        bgr_frames = []
-        for i in range(n_imgs):
-            frame = unnormalise_image(images[b, i].cpu(), img_mean, img_std)
-            frame = cv2.resize(frame, (canvas_w, canvas_h))
-            bgr_frames.append(frame)
+        # ── DiT visual future prediction ─────────────────────
+        pred_rgb = None
+        if has_predictor:
+            try:
+                _, _, vce, wv = model(
+                    images=imgs_in, input_ids=ids_in,
+                    attention_mask=mask_in, states=states_in,
+                    image_mask=img_mask_in,
+                )
+                n_frames = min(wv.size(1), num_predict_cap) if wv is not None else num_predict_cap
+                preds = model.predict_visual_future(
+                    past_rgb=imgs_in, visual_context_emb=vce,
+                    num_frames=n_frames, world_video_query_hiddens=wv,
+                )
+                if preds and "rgb" in preds:
+                    pred_rgb = preds["rgb"]
+            except Exception as e:
+                logger.warning("Visual pred failed sample {}: {}", b, e)
 
-        # --- GT actions ---
-        gt_act = actions[b].cpu().numpy()
-        amask = action_mask_b[b].cpu().numpy()
-        valid_t = int(amask.sum())
-        gt_act_valid = gt_act[:valid_t] if valid_t > 0 else None
-
-        # --- Model prediction ---
-        pred_answer = None
-        pred_actions_np = None
+        # ── text + action generation ─────────────────────────
+        pred_answer = ""
+        act_preds   = None
         try:
-            imgs_in = images[b:b+1]                      # [1, N, 3, H, W]
-            ids_in = input_ids[b:b+1]                    # [1, seq_len]
-            mask_in = attention_mask[b:b+1]
-            states_in = states[b:b+1]                    # [1, S, state_dim]
-
             pred_text, act_preds = generate_text(
                 model, tokenizer, imgs_in, ids_in, mask_in, states_in,
-                max_new_tokens=128, device=device,
+                max_new_tokens=96, device=device,
             )
-            # Extract generated portion
-            if "assistant" in pred_text:
-                pred_answer = pred_text.split("assistant")[-1].strip()
-            else:
-                pred_answer = pred_text.strip()
-
-            if act_preds is not None:
-                pred_actions_np = (
-                    act_preds[0, 0].cpu().numpy()
-                )
+            pred_answer = pred_text.strip()
+            for tok in ("<halo_action>", "<halo_world_video>"):
+                pred_answer = pred_answer.replace(tok, "").strip()
+            if not pred_answer:
+                pred_answer = "(no output)"
+            pred_answer = pred_answer[:90]
         except Exception as e:
-            logger.warning("Vis generation failed for sample {}: {}", b, e)
-        # ---- Save as GIF instead of MP4 ----
-        import imageio
+            logger.warning("Text gen failed sample {}: {}", b, e)
+            pred_answer = "(error)"
 
-        gif_path = vis_dir / f"sample_{b}_vla_step{global_step}.gif"
-        # Convert BGR frames to RGB and repeat each frame according to frame_hold
-        rgb_frames = []
-        for frame in bgr_frames:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # ── action arrays: full GT traj + predicted chunk ────
+        gt_actions_np   = None
+        pred_actions_np = None
+        if batch.get("actions") is not None:
+            try:
+                gt_actions_np = batch["actions"][b].cpu().float().numpy()  # [T, D]
+            except Exception:
+                pass
+        if act_preds is not None:
+            try:
+                # Use only the last chunk (conditioned on the last action token)
+                # so the pred length matches chunk_size, not n_act*chunk_size.
+                pred_actions_np = act_preds[0, -1].cpu().float().numpy()  # [chunk_size, D]
+            except Exception:
+                pass
+
+        # ── correctness heuristic for badge ──────────────────
+        def _word_overlap(g: str, p: str) -> float:
+            gw = set(g.lower().split())
+            pw = set(p.lower().split())
+            if not gw:
+                return 1.0
+            return len(gw & pw) / max(len(gw), 1)
+        is_correct = (_word_overlap(gt_answer, pred_answer) >= 0.5)
+
+        # ── pre-render action charts once per sample ─────────
+        chart_gt   = render_action_chart(gt_actions_np, None)
+        chart_both = render_action_chart(gt_actions_np, pred_actions_np)
+
+        last_ctx_bgr = unnormalise_image(images[b, n_imgs - 1].cpu(), img_mean, img_std)
+        n_pred       = pred_rgb.size(1)  if pred_rgb  is not None else 0
+        n_gt_fut     = gt_future.size(1) if gt_future is not None else 0
+        pred_words   = pred_answer.split()
+
+        gif_frames    = []
+        gif_durations = []          # ms per GIF frame
+
+        # Timing per GIF frame (ms).
+        ms_ctx    = max(150, 1000 // max(fps_ctx, 1))
+        ms_word   = max( 80, 1000 // max(fps_text, 1))
+        ms_future = max( 80, 1000 // max(fps_future, 1))
+
+        # ── Phase 1 : context scroll (slow) ──────────────────
+        for i in range(n_imgs):
+            c = _new_canvas()
+            draw_header(c, task_text, gt_answer, "", is_correct=None)
+            ctx_bgr = unnormalise_image(images[b, i].cpu(), img_mean, img_std)
+            place_image(c, ctx_bgr, 0, 0, f"Context {i+1}/{n_imgs}")
+            place_chart(c, chart_gt, 0, 1, "Action  GT only", C_GRN)
+            place_placeholder(c, 1, 0, "GT Future")
+            place_placeholder(c, 1, 1, "DiT Predicted")
             for _ in range(frame_hold):
-                rgb_frames.append(rgb)
-        # Write GIF (loop forever)
-        imageio.mimsave(str(gif_path), rgb_frames, fps=fps, loop=0)
+                gif_frames.append(to_rgb_array(c))
+                gif_durations.append(ms_ctx)
 
-        written += 1
-        # --- Create video ---
-        video_path = str(vis_dir / f"sample_{b}_vla_step{global_step}.mp4")
-        create_video(
-            frames=bgr_frames,
-            question=question,
-            gt_answer=gt_answer,
-            pred_answer=pred_answer,
-            gt_actions=gt_act_valid,
-            pred_actions=pred_actions_np,
-            output_path=video_path,
-            fps=fps,
-            frame_hold=frame_hold,
-        )
+        # ── Phase 2 : autoregressive text reveal ─────────────
+        for wi in range(max(len(pred_words), 1)):
+            partial = " ".join(pred_words[: wi + 1]) if pred_words else pred_answer
+            is_last = wi == len(pred_words) - 1
+            c = _new_canvas()
+            draw_header(c, task_text, gt_answer, partial,
+                        cursor=not is_last, is_correct=is_correct)
+            place_image(c, last_ctx_bgr, 0, 0, f"Context {n_imgs}/{n_imgs}")
+            place_chart(c, chart_gt, 0, 1, "Action  GT only", C_GRN)
+            place_placeholder(c, 1, 0, "GT Future")
+            place_placeholder(c, 1, 1, "DiT Predicted")
+            gif_frames.append(to_rgb_array(c))
+            gif_durations.append(ms_word)
 
-    model.train()
-    logger.info(
-        "Generated {} visualisation gif at step {} → {}",
-        written, global_step, vis_dir,
-    )
+        # hold on completed prediction for a beat
+        for _ in range(2):
+            c = _new_canvas()
+            draw_header(c, task_text, gt_answer, pred_answer, is_correct=is_correct)
+            place_image(c, last_ctx_bgr, 0, 0, f"Context {n_imgs}/{n_imgs}")
+            place_chart(c, chart_gt, 0, 1, "Action  GT only", C_GRN)
+            place_placeholder(c, 1, 0, "GT Future")
+            place_placeholder(c, 1, 1, "DiT Predicted")
+            gif_frames.append(to_rgb_array(c))
+            gif_durations.append(ms_ctx)
 
-# -----------------------
-@torch.no_grad()
-def generate_training_videos_with_pred(
-    model, batch, tokenizer, config, device, output_dir, global_step, epoch,
-    max_videos=4, min_frames=3, canvas_w=640, canvas_h=480,
-    fps=2, frame_hold=2, img_mean=(0.485,0.456,0.406), img_std=(0.229,0.224,0.225),
-):
-    import cv2
-    import numpy as np
+        # ── Phase 2.5 : action trajectory animated reveal ────
+        if pred_actions_np is not None:
+            n_act_steps = pred_actions_np.shape[0]
+            for step_i in range(1, n_act_steps + 1):
+                c = _new_canvas()
+                draw_header(c, task_text, gt_answer, pred_answer,
+                            is_correct=is_correct)
+                place_image(c, last_ctx_bgr, 0, 0,
+                            f"Context {n_imgs}/{n_imgs}")
+                act_chart = render_action_chart(gt_actions_np, pred_actions_np,
+                                               reveal_up_to=step_i)
+                place_chart(c, act_chart, 0, 1,
+                            f"Action  step {step_i}/{n_act_steps}", C_CYN)
+                place_placeholder(c, 1, 0, "GT Future")
+                place_placeholder(c, 1, 1, "DiT Predicted")
+                gif_frames.append(to_rgb_array(c))
+                gif_durations.append(ms_future)
 
-    model.eval()
-    vis_dir = output_dir / f"vis_epoch{epoch}_step{global_step}"
-    vis_dir.mkdir(parents=True, exist_ok=True)
-
-    images = batch["images"].to(device)          # [B, N, 3, H, W]
-    input_ids = batch["input_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
-    states = batch["states"].to(device)
-    image_mask = batch.get("image_mask")
-    img_h, img_w = images.shape[-2:]
-
-    B = images.size(0)
-    written = 0
-
-    for b in range(B):
-        if written >= max_videos:
-            break
-        if image_mask is not None and int(image_mask[b].sum().item()) < min_frames:
-            continue
-
-        # ---- Run model to get conditioning ----
-        imgs_in = images[b:b+1]
-        ids_in = input_ids[b:b+1]
-        mask_in = attention_mask[b:b+1]
-        states_in = states[b:b+1]
-        img_mask_in = image_mask[b:b+1] if image_mask is not None else None
-
-        _, _, visual_context_emb = model(
-            images=imgs_in,
-            input_ids=ids_in,
-            attention_mask=mask_in,
-            states=states_in,
-            image_mask=img_mask_in,
-        )   # visual_context_emb: [1, L, D]
-
-        # ---- Generate predicted future RGB frame ----
-        if hasattr(model, 'visual_predictor'):
-            # The predictor expects conditioning of shape [B, emb_dim]
-            # We pool over the sequence length
-            cond = visual_context_emb   # [1, 512] – already pooled
-            pred_frame = model.visual_predictor.predict_future_rgb(
-                past_rgb=imgs_in,
-                height=img_h,
-                width=img_w,
-                context_emb=cond,
-            )  # shape: [1, 3, H, W]
+        # ── Phase 3 : future frame reveal ────────────────────
+        if pred_actions_np is not None:
+            act_lbl = "Action  GT (solid)  /  Pred (dashed)"
+            act_col = C_CYN
         else:
-            logger.warning("model has no visual_predictor; skipping generation")
+            act_lbl = "Action  GT only"
+            act_col = C_GRN
+        n_future_steps = max(n_pred, n_gt_fut, 1)
+        for f in range(n_future_steps):
+            c = _new_canvas()
+            draw_header(c, task_text, gt_answer, pred_answer, is_correct=is_correct)
+            place_image(c, last_ctx_bgr, 0, 0, f"Context {n_imgs}/{n_imgs}")
+            place_chart(c, chart_both, 0, 1, act_lbl, act_col)
+
+            if gt_future is not None and f < n_gt_fut:
+                gt_bgr = unnormalise_image(gt_future[b, f].cpu(), img_mean, img_std)
+                place_image(c, gt_bgr, 1, 0,
+                            f"GT Future {f+1}/{n_gt_fut}",
+                            color=C_GRN, border=C_GRN)
+            else:
+                place_placeholder(c, 1, 0, f"GT Future {f+1}")
+
+            if pred_rgb is not None and f < n_pred:
+                pf     = pred_rgb[0, f].clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
+                pf_bgr = cv2.cvtColor((pf * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                place_image(c, pf_bgr, 1, 1,
+                            f"DiT Predicted {f+1}/{n_pred}",
+                            color=C_CYN, border=C_CYN)
+            else:
+                place_placeholder(c, 1, 1, f"DiT Predicted {f+1}")
+
+            for _ in range(frame_hold):
+                gif_frames.append(to_rgb_array(c))
+                gif_durations.append(ms_future)
+
+        if not gif_frames:
             continue
 
-        mean_t = torch.tensor(img_mean, device=pred_frame.device).view(1, 3, 1, 1)
-        std_t = torch.tensor(img_std, device=pred_frame.device).view(1, 3, 1, 1)
-        pred_denorm = pred_frame * std_t + mean_t
-        pred_denorm = torch.clamp(pred_denorm, 0, 1)
+        gif_path = vis_dir / f"sample_{b}_step{global_step}.gif"
+        imageio.v2.mimsave(str(gif_path), gif_frames, duration=gif_durations, loop=0)
 
-        # Convert to BGR for OpenCV
-        pred_np = pred_denorm[0].cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
-        pred_np = (pred_np * 255).clip(0, 255).astype(np.uint8)
-        pred_bgr = cv2.cvtColor(pred_np, cv2.COLOR_RGB2BGR)
-        pred_bgr = cv2.resize(pred_bgr, (canvas_w, canvas_h))
-
-        import imageio
-
-        gif_path = vis_dir / f"sample_{b}_pred_step{global_step}.gif"
-        # Convert BGR frame to RGB for GIF
-        frame_rgb = cv2.cvtColor(pred_bgr, cv2.COLOR_BGR2RGB)
-        # Create a list repeating the same frame to form an animation
-        frames_rgb = [frame_rgb] * (frame_hold * 10)
-        imageio.mimsave(str(gif_path), frames_rgb, fps=fps, loop=0)
+        # ── Separate noise -> image GIF for the first predicted frame ──
+        if has_predictor:
+            try:
+                _, _, vce_diff, wv_diff = model(
+                    images=imgs_in, input_ids=ids_in,
+                    attention_mask=mask_in, states=states_in,
+                    image_mask=img_mask_in,
+                )
+                if vce_diff is not None:
+                    n_frames_d = 1
+                    if wv_diff is not None:
+                        n_frames_d = max(1, min(wv_diff.size(1), num_predict_cap))
+                    h_in, w_in = imgs_in.shape[-2], imgs_in.shape[-1]
+                    dit_steps = getattr(config, "dit_num_sample_steps", diffusion_steps)
+                    snapshots, step_times = sample_dit_with_intermediates(
+                        model.visual_predictor,
+                        text_emb=vce_diff,
+                        height=h_in, width=w_in,
+                        num_frames=n_frames_d,
+                        num_steps=dit_steps,
+                        num_snapshots=dit_steps,
+                        world_video_query_hiddens=wv_diff,
+                    )
+                    if snapshots:
+                        diff_path = vis_dir / f"sample_{b}_step{global_step}_diffusion.gif"
+                        save_diffusion_gif(
+                            snapshots, step_times,
+                            output_path=str(diff_path),
+                            frame_idx=0,
+                            sample_idx=0,
+                            canvas_w=PANEL_W,
+                            canvas_h=PANEL_H,
+                            fps=diffusion_fps,
+                        )
+            except Exception as e:
+                logger.warning("Diffusion GIF failed sample {}: {}", b, e)
 
         written += 1
 
-        # # ---- Write a short video (loop the single frame for visibility) ----
-        # pred_video_path = str(vis_dir / f"sample_{b}_pred_step{global_step}.mp4")
-        # fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        # out_vid = cv2.VideoWriter(pred_video_path, fourcc, fps, (canvas_w, canvas_h))
-        # for _ in range(frame_hold * 10):   # repeat frame to make a short clip
-        #     out_vid.write(pred_bgr)
-        # out_vid.release()
-
-        # written += 1
-
     model.train()
-    logger.info("Saved predicted videos for {} samples in {}", written, vis_dir)
+    logger.info("Saved {} visualization GIFs -> {}", written, vis_dir)
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -372,6 +643,7 @@ def train(args):
         action_dim=args.action_dim,
         state_dim=args.state_dim,
         action_chunk_size=args.action_chunk_size,
+        num_visual_predict_frames=args.num_predict_frames,
     )
     if args.visual_loss_weight is not None:
         config.visual_loss_weight = args.visual_loss_weight
@@ -409,6 +681,7 @@ def train(args):
             action_dim=args.action_dim,
             state_dim=args.state_dim,
             num_sample_frames=args.moma_num_frames,
+            num_predict_frames=args.num_predict_frames,
             frame_stride=args.moma_frame_stride,
             camera=args.moma_camera,
             shuffle=True,
@@ -421,8 +694,8 @@ def train(args):
 
     # ---- Optimizer & scheduler ----
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader))
-    scaler = GradScaler() 
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs * len(train_loader)))
+    scaler = GradScaler("cuda")
 
     # ---- Checkpoint dir ----
     ckpt_dir = Path(args.ckpt_dir)
@@ -453,6 +726,7 @@ def train(args):
         epoch_act_loss = 0.0
         epoch_vis_loss = 0.0
         epoch_total_loss = 0.0
+        n_steps = 0
         t0 = time.time()
 
         for step, batch in enumerate(train_loader, 1):
@@ -521,8 +795,8 @@ def train(args):
             # optimizer.step()
             # scheduler.step()
             # --- Mixed precision forward pass ---
-            with autocast():
-                logits, action_hiddens, visual_context_emb = model(
+            with autocast("cuda"):
+                logits, action_hiddens, visual_context_emb, world_video_query_hiddens = model(
                     images=images,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -536,8 +810,13 @@ def train(args):
 
                 lang_loss = compute_language_loss(logits, labels, num_prepended)
                 act_loss = model.compute_flow_loss(action_hiddens, actions, action_mask)
+                future_frames = batch.get("future_frames")
+                if future_frames is not None:
+                    future_frames = future_frames.to(device)
                 vis_loss = model.compute_visual_prediction_loss(
-                    images, batch.get("image_mask"), visual_context_emb
+                    images, batch.get("image_mask"), visual_context_emb,
+                    world_video_query_hiddens=world_video_query_hiddens,
+                    future_frames=future_frames,
                 )
                 total_loss = (
                     lang_loss
@@ -559,6 +838,7 @@ def train(args):
             scheduler.step()         # step scheduler after optimizer step
 
             global_step += 1
+            n_steps += 1
             epoch_lang_loss += lang_loss.item()
             epoch_act_loss += act_loss.item()
             epoch_vis_loss += vis_loss.item()
@@ -590,34 +870,22 @@ def train(args):
                         "train/input_frames", grid, global_step, dataformats="NCHW"
                     )
 
-            # Visualisation videos
+            # Visualisation GIFs
             if args.vis_every > 0 and global_step % args.vis_every == 0:
-                generate_training_videos_gif(
+                generate_training_visualization(
                     model=model, batch=batch, tokenizer=tokenizer, config=config,
-                    device=device, output_dir=Path(args.ckpt_dir), global_step=global_step,
+                    device=device, output_dir=ckpt_dir, global_step=global_step,
                     epoch=epoch, max_videos=args.vis_max_videos, min_frames=args.vis_min_frames,
-                )
-                generate_training_videos_with_pred(
-                    model=model,
-                    batch=batch,
-                    tokenizer=tokenizer,
-                    config=config,
-                    device=device,
-                    output_dir=ckpt_dir,
-                    global_step=global_step,
-                    epoch=epoch,
-                    max_videos=args.vis_max_videos,
-                    min_frames=args.vis_min_frames,
                 )
                 
 
 
         # End of epoch summary
-        n = len(train_loader)
+        n = max(n_steps, 1)   # guard against empty loader (e.g. max_samples=1 + drop_last)
         elapsed = time.time() - t0
         logger.info(
-            "=== Epoch {} done in {:.1f}s | avg lang={:.4f}  act={:.4f}  vis={:.4f}  total={:.4f} ===",
-            epoch, elapsed,
+            "=== Epoch {} done in {:.1f}s  steps={}  | avg lang={:.4f}  act={:.4f}  vis={:.4f}  total={:.4f} ===",
+            epoch, elapsed, n_steps,
             epoch_lang_loss / n, epoch_act_loss / n, epoch_vis_loss / n, epoch_total_loss / n,
         )
 
@@ -627,9 +895,11 @@ def train(args):
             tb_writer.add_scalar("epoch_avg/visual_dit", epoch_vis_loss / n, epoch)
             tb_writer.add_scalar("epoch_avg/total", epoch_total_loss / n, epoch)
 
-        # Save checkpoint
+        # Save checkpoint — atomic (write to .tmp then rename) so a disk-full
+        # or crash never leaves a corrupted file.  Prune old checkpoints after.
         if epoch % args.save_every == 0 or epoch == args.epochs:
             ckpt_path = ckpt_dir / f"halo_vla_epoch{epoch}.pt"
+            tmp_path  = ckpt_dir / f".tmp_epoch{epoch}.pt"
             torch.save(
                 {
                     "epoch": epoch,
@@ -639,9 +909,20 @@ def train(args):
                     "scheduler_state_dict": scheduler.state_dict(),
                     "config": config,
                 },
-                ckpt_path,
+                tmp_path,
             )
+            tmp_path.replace(ckpt_path)   # atomic rename on POSIX
             logger.info("Saved checkpoint → {}", ckpt_path)
+
+            # Prune: keep only the latest `--keep_ckpts` checkpoints
+            if args.keep_ckpts > 0:
+                old_ckpts = sorted(
+                    ckpt_dir.glob("halo_vla_epoch*.pt"),
+                    key=lambda p: int(p.stem.replace("halo_vla_epoch", "")),
+                )
+                for old in old_ckpts[: -args.keep_ckpts]:
+                    old.unlink()
+                    logger.info("Removed old checkpoint {}", old)
 
     logger.info("Training complete.")
     if tb_writer is not None:
@@ -668,14 +949,20 @@ def parse_args():
         default=None,
         help="Path to local airoa-moma clone (episodes.jsonl + videos/). Required for --dataset moma.",
     )
-    p.add_argument("--moma_camera", default="hand", choices=("hand", "head"))
+    p.add_argument("--moma_camera", default="head", choices=("hand", "head"))
     p.add_argument(
         "--moma_num_frames",
         type=int,
-        default=3,
-        help="Temporal frames per sample (>=2 enables future-frame DiT loss)",
+        default=5,
+        help="Context frames per sample fed to the model as input",
     )
-    p.add_argument("--moma_frame_stride", type=int, default=2)
+    p.add_argument(
+        "--num_predict_frames",
+        type=int,
+        default=5,
+        help="Future frames to predict beyond the context window (sets num_visual_predict_frames)",
+    )
+    p.add_argument("--moma_frame_stride", type=int, default=25)
     p.add_argument("--moma_max_action_len", type=int, default=256)
     p.add_argument(
         "--moma_num_workers",
@@ -711,7 +998,9 @@ def parse_args():
 
     # Logging & checkpoints
     p.add_argument("--log_every", type=int, default=10)
-    p.add_argument("--save_every", type=int, default=1)
+    p.add_argument("--save_every", type=int, default=100)
+    p.add_argument("--keep_ckpts", type=int, default=3,
+                    help="Keep only the last N checkpoints (0 = keep all)")
     p.add_argument("--ckpt_dir", default="checkpoints")
     p.add_argument(
         "--tensorboard_dir",

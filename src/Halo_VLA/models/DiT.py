@@ -99,10 +99,9 @@ class DiT(nn.Module):
             in_channels, hidden_size, kernel_size=patch_size, stride=patch_size,
             padding=0
         )
-        # Number of visual tokens (assuming square input)
-        # At construction time we don't know resolution, but we can set a max
+        # Number of visual tokens at maximum resolution (in patch units, not pixels)
         self.max_res = config.dit_max_resolution
-        num_patches = self.max_res * self.max_res
+        num_patches = (self.max_res // patch_size) ** 2
         self.pos_embed = nn.Parameter(
             torch.zeros(1, num_patches, hidden_size), requires_grad=True
         )
@@ -149,12 +148,13 @@ class DiT(nn.Module):
         ph, pw = x_patch.shape[2], x_patch.shape[3]
         x_patch = x_patch.flatten(2).transpose(1, 2)  # [B, N, hidden_size], N = ph*pw
 
-        # 2. Add positional embedding (interpolate if resolution differs)
-        if ph * pw != self.max_res * self.max_res:
+        # 2. Add positional embedding (interpolate if resolution differs from max)
+        max_ph = self.max_res // self.patch_size
+        if ph != max_ph or pw != max_ph:
             pos_embed = F.interpolate(
-                self.pos_embed.reshape(1, self.max_res, self.max_res, -1).permute(0,3,1,2),
-                size=(ph, pw), mode='bilinear'
-            ).flatten(2).permute(0,2,1)
+                self.pos_embed.reshape(1, max_ph, max_ph, -1).permute(0, 3, 1, 2),
+                size=(ph, pw), mode='bilinear', align_corners=False,
+            ).flatten(2).permute(0, 2, 1)
         else:
             pos_embed = self.pos_embed
         x_patch = x_patch + pos_embed

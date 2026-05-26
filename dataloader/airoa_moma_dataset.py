@@ -46,7 +46,7 @@ class AiroaMomaConfig:
 
     data_root: str  # directory containing episodes.jsonl and videos/
 
-    tokenizer_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    tokenizer_name: str = "HuggingFaceTB/cosmo2-tokenizer"
     img_size: int = 224
     img_mean: Tuple[float, ...] = (0.485, 0.456, 0.406)
     img_std: Tuple[float, ...] = (0.229, 0.224, 0.225)
@@ -56,10 +56,11 @@ class AiroaMomaConfig:
     action_dim: int = 32
     state_dim: int = 32
 
-    # Video sampling (temporal context + “future” = last frame in the stack)
-    camera: str = "hand"  # "hand" | "head"
+    # Video sampling: num_sample_frames context frames + num_predict_frames future targets
+    camera: str = "head"  # "hand" | "head"
     num_sample_frames: int = 8
-    frame_stride: int = 4  # consecutive windows: t, t+stride, ...
+    num_predict_frames: int = 1      # future frames returned as "future_frames" in batch
+    frame_stride: int = 14  # consecutive windows: t, t+stride, ...
     min_episode_length: int = 32  # skip shorter episodes (metadata or probe)
 
     # Path templates relative to data_root
@@ -85,7 +86,7 @@ class AiroaMomaDataset(Dataset):
     """
     One training item = one **window** of frames from one episode + task text + state/action slice.
 
-    ``images`` are ordered in time; the **last** image is the “future” target for the
+    ``images`` are ordered in time; the **last** image is the "future" target for the
     visual DiT head when ``num_sample_frames >= 2`` (matches ``compute_visual_prediction_loss``).
     """
 
@@ -110,17 +111,12 @@ class AiroaMomaDataset(Dataset):
             self.cfg.img_size, self.cfg.img_mean, self.cfg.img_std
         )
 
-        jsonl_path = self.root / self.cfg.episodes_jsonl
-        if not jsonl_path.is_file():
-            raise FileNotFoundError(
-                f"Missing {jsonl_path}. Clone the dataset and ensure episodes.jsonl exists.\n"
-                "See https://huggingface.co/datasets/airoa-org/airoa-moma"
-            )
-        raw = self._load_episodes_jsonl(jsonl_path)
+        # Load episodes: prefer parquet metadata, fall back to video-file scan.
+        raw = self._load_episodes()
         self.episodes = self._filter_episodes(raw)
         if self.cfg.max_samples is not None:
             self.episodes = self.episodes[: self.cfg.max_samples]
-        self._rng = random.Random(self.cfg.seed)
+        # _rng is only used as a fallback; per-item sampling uses a per-index seed.
 
         logger.info(
             "AiroaMomaDataset: {} episodes under {} (camera={}, frames={}, stride={})",
@@ -131,7 +127,150 @@ class AiroaMomaDataset(Dataset):
             self.cfg.frame_stride,
         )
 
+    # ------------------------------------------------------------------
+    # Episode discovery: parquet → video scan → jsonl (priority order)
+    # ------------------------------------------------------------------
+
+    def _load_episodes(self) -> List[Dict[str, Any]]:
+        """Return a list of episode dicts, trying sources in priority order."""
+        # 1. Try lerobot-format parquet under meta/episodes/
+        parquet_dir = self.root / "meta" / "episodes"
+        if parquet_dir.is_dir():
+            rows = self._load_episodes_parquet(parquet_dir)
+            if rows:
+                logger.info("Loaded {} episodes from meta/episodes/ parquet.", len(rows))
+                return rows
+
+        # 2. Fallback: scan video files from disk (pure stdlib, no deps)
+        rows = self._scan_video_files()
+        if rows:
+            logger.info(
+                "Loaded {} episodes by scanning video directory (no parquet found).",
+                len(rows),
+            )
+            return rows
+
+        # 3. Legacy: try episodes.jsonl
+        jsonl_path = self.root / self.cfg.episodes_jsonl
+        if jsonl_path.is_file():
+            rows = self._load_episodes_jsonl(jsonl_path)
+            # episodes.jsonl may be the global stats file (1 line); discard if so
+            if rows and "episode_index" in rows[0]:
+                logger.info("Loaded {} episodes from episodes.jsonl.", len(rows))
+                return rows
+
+        logger.warning(
+            "No episode metadata found under {}. "
+            "Expected meta/episodes/ parquet or video files at "
+            "videos/observation.image.{}/chunk-*/file-*.mp4",
+            self.root,
+            self.cfg.camera,
+        )
+        return []
+
+    def _load_episodes_parquet(self, parquet_dir: Path) -> List[Dict[str, Any]]:
+        """Read all parquet files under meta/episodes/ using pyarrow (no pandas)."""
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+        except ImportError:
+            logger.warning("pyarrow not available; skipping parquet load.")
+            return []
+
+        # Load optional task index → task string mapping
+        task_map: Dict[int, str] = self._load_task_map()
+
+        rows: List[Dict[str, Any]] = []
+        for pq_file in sorted(parquet_dir.rglob("*.parquet")):
+            try:
+                table = pq.read_table(pq_file)
+            except Exception as exc:
+                logger.warning("Could not read {}: {}", pq_file, exc)
+                continue
+            names = table.schema.names
+            for i in range(table.num_rows):
+                rec: Dict[str, Any] = {}
+                for col in names:
+                    val = table[col][i].as_py()
+                    rec[col] = val
+                # Normalise episode_index field name
+                if "episode_index" not in rec:
+                    # lerobot v2 may call it 'index'
+                    rec["episode_index"] = rec.get("index", i)
+                # Attach video_rel_path so _video_path() can resolve it
+                ep_idx = int(rec["episode_index"])
+                chunk = ep_idx // self.cfg.episodes_per_chunk
+                file_num = ep_idx % self.cfg.episodes_per_chunk
+                rec["video_rel_path"] = (
+                    f"videos/observation.image.{self.cfg.camera}"
+                    f"/chunk-{chunk:03d}/file-{file_num:03d}.mp4"
+                )
+                # Attach task text
+                task_idx = rec.get("task_index", None)
+                if task_idx is not None and task_idx in task_map:
+                    rec["tasks"] = [task_map[int(task_idx)]]
+                elif "tasks" not in rec:
+                    rec["tasks"] = [rec.get("short_horizon_task", "manipulation")]
+                rows.append(rec)
+
+        rows.sort(key=lambda r: int(r.get("episode_index", 0)))
+        return rows
+
+    def _load_task_map(self) -> Dict[int, str]:
+        """Load meta/tasks.parquet → {task_index: task_string}. Best-effort."""
+        tasks_pq = self.root / "meta" / "tasks.parquet"
+        if not tasks_pq.is_file():
+            return {}
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+            table = pq.read_table(tasks_pq)
+            task_map: Dict[int, str] = {}
+            names = table.schema.names
+            idx_col = "task_index" if "task_index" in names else (names[0] if names else None)
+            txt_col = (
+                "task" if "task" in names
+                else "short_horizon_task" if "short_horizon_task" in names
+                else (names[1] if len(names) > 1 else None)
+            )
+            if idx_col and txt_col:
+                for i in range(table.num_rows):
+                    k = table[idx_col][i].as_py()
+                    v = table[txt_col][i].as_py()
+                    if k is not None:
+                        task_map[int(k)] = str(v)
+            return task_map
+        except Exception as exc:
+            logger.warning("Could not load tasks.parquet: {}", exc)
+            return {}
+
+    def _scan_video_files(self) -> List[Dict[str, Any]]:
+        """Pure-stdlib fallback: discover episodes from video files on disk."""
+        import re
+        videos_root = self.root / "videos" / f"observation.image.{self.cfg.camera}"
+        if not videos_root.is_dir():
+            return []
+        rows: List[Dict[str, Any]] = []
+        for chunk_dir in sorted(videos_root.glob("chunk-*")):
+            m = re.search(r"chunk-(\d+)", chunk_dir.name)
+            if not m:
+                continue
+            chunk_idx = int(m.group(1))
+            for mp4 in sorted(chunk_dir.glob("file-*.mp4")):
+                fm = re.search(r"file-(\d+)", mp4.stem)
+                if not fm:
+                    continue
+                file_num = int(fm.group(1))
+                ep_idx = chunk_idx * self.cfg.episodes_per_chunk + file_num
+                rows.append({
+                    "episode_index": ep_idx,
+                    "length": 0,
+                    "tasks": ["manipulation"],
+                    "video_rel_path": str(mp4.relative_to(self.root)),
+                })
+        rows.sort(key=lambda r: r["episode_index"])
+        return rows
+
     def _load_episodes_jsonl(self, path: Path) -> List[Dict[str, Any]]:
+        """Legacy loader for episodes.jsonl."""
         rows: List[Dict[str, Any]] = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -143,18 +282,21 @@ class AiroaMomaDataset(Dataset):
         return rows
 
     def _filter_episodes(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        # Remove the video file and length checks; keep all episodes.
         ok = []
         for m in rows:
             ep = int(m.get("episode_index", -1))
-            if ep < 0: continue
-            vid = self._video_path(ep)
+            if ep < 0:
+                continue
+            vid = self._video_path(ep, meta=m)
             if vid.is_file():
                 ok.append(m)
         if not ok:
-            logger.warning("No episodes found in jsonl")
+            logger.warning(
+                "No episodes found — video files not matched. "
+                "Run scripts/generate_episodes_jsonl.py to rebuild episodes.jsonl."
+            )
         else:
-            logger.info(f"Using all {len(ok)} episodes (video checks disabled)")
+            logger.info(f"Loaded {len(ok)} episodes with verified video paths.")
         return ok
 
     def _setup_tokenizer(self, tokenizer):
@@ -184,16 +326,21 @@ class AiroaMomaDataset(Dataset):
         self._image_tok = get_token("image_token")
         self._action_tok = get_token("action_token")
         self._state_tok = get_token("state_token")
+        self._world_video_tok = get_token("world_video_token")
         self.pad_token_id = self.tokenizer.pad_token_id
 
-    def _video_path(self, episode_index: int) -> Path:
+    def _video_path(self, episode_index: int, meta: Optional[Dict[str, Any]] = None) -> Path:
+        # Prefer the explicit relative path written by generate_episodes_jsonl.py
+        if meta is not None and meta.get("video_rel_path"):
+            return self.root / meta["video_rel_path"]
+        # Fallback: reconstruct from episode_index using the template
         chunk = int(episode_index) // self.cfg.episodes_per_chunk
-        file_num = int(episode_index) % self.cfg.episodes_per_chunk   # 0‑999 per chunk
+        file_num = int(episode_index) % self.cfg.episodes_per_chunk   # 0–999 per chunk
         rel = self.cfg.video_rel_template.format(
             chunk=chunk,
             camera=self.cfg.camera,
             ep=int(episode_index),
-            file_num=file_num,          # add this line
+            file_num=file_num,
         )
         return self.root / rel
 
@@ -206,20 +353,38 @@ class AiroaMomaDataset(Dataset):
     #     cap.release()
     #     return max(n, 0)
     def _get_video_frame_count(self, video_path: Path) -> int:
-        """Return the exact number of frames in the video using PyAV."""
+        """
+        Return frame count without decoding the video.
+
+        Priority:
+          1. stream.frames — set by most MP4 muxers, instant.
+          2. Estimate from duration × fps — fast, off by ±1 at worst.
+          3. Count demux packets (no decode) — much faster than full decode.
+        Full-decode fallback is intentionally removed: it could take 30-40s on
+        long robot episodes and was called on every __getitem__ call.
+        """
         import av
         try:
             container = av.open(str(video_path))
             stream = container.streams.video[0]
-            # Some AV1 files may not have stream.frames set; fallback to counting
-            count = stream.frames if stream.frames else 0
-            if count == 0:
-                # Count manually
-                for packet in container.demux(stream):
-                    for _ in packet.decode():
-                        count += 1
+
+            # Fast path 1: muxer wrote frame count into the stream header.
+            if stream.frames and stream.frames > 0:
+                container.close()
+                return int(stream.frames)
+
+            # Fast path 2: duration × average frame rate (no decoding).
+            if stream.duration and stream.average_rate:
+                dur_s = float(stream.duration) * stream.time_base
+                fps   = float(stream.average_rate)
+                if dur_s > 0 and fps > 0:
+                    container.close()
+                    return max(1, round(dur_s * fps))
+
+            # Fast path 3: count packets (mux-level, no pixel decoding).
+            count = sum(1 for p in container.demux(stream) if p.size > 0)
             container.close()
-            return count
+            return max(count, 1)
         except Exception as e:
             logger.warning(f"Failed to get frame count for {video_path}: {e}")
             return 0
@@ -385,8 +550,12 @@ class AiroaMomaDataset(Dataset):
             f"{img_tags} {self._state_tok} Task: {task_txt}\n"
             "Predict the robot's motion and describe the next step."
         )
+        # One <halo_world_video> token per future frame to predict, so the transformer
+        # emits exactly num_predict_frames query vectors for the DiT conditioning.
+        wv_tokens = self._world_video_tok * self.cfg.num_predict_frames
         assistant_body = (
-            f"I will execute the task: {task_txt}\n{self._action_tok}"
+            f"I will execute the task: {task_txt}\n"
+            f"{wv_tokens}{self._action_tok}"
         )
         return user_body, assistant_body
 
@@ -464,37 +633,54 @@ class AiroaMomaDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         meta = self.episodes[idx]
         ep = int(meta.get("episode_index", idx))
-        vid_path = self._video_path(ep)
+        vid_path = self._video_path(ep, meta=meta)
 
+        # Use parquet/jsonl length when available — avoids opening the video.
+        # Only fall back to probing the file when length is missing or zero.
         T_meta = int(meta.get("length", 0) or 0)
-        if vid_path.is_file():
-            T_vid = self._get_video_frame_count(vid_path)
+        if T_meta > 0:
+            T = T_meta
+        elif vid_path.is_file():
+            T = self._get_video_frame_count(vid_path)
         else:
-            T_vid = 0
-        T_meta = int(meta.get("length", 0) or 0)
-        T = T_vid if T_vid > 0 else T_meta 
+            T = 0
 
         n = self.cfg.num_sample_frames
+        p = self.cfg.num_predict_frames  # future frames to predict
+        total = n + p
         stride = self.cfg.frame_stride
-        span = (n - 1) * stride + 1
+        span = (total - 1) * stride + 1
         if T < span:
-            stride = max(1, (T - 1) // max(n - 1, 1))
-            span = (n - 1) * stride + 1
+            stride = max(1, (T - 1) // max(total - 1, 1))
+            span = (total - 1) * stride + 1
         t0_max = max(0, T - span)
-        t0 = self._rng.randint(0, t0_max) if self.split == "train" else 0
-        frame_indices = [t0 + j * stride for j in range(n)]
+        if self.split != "train" or t0_max == 0:
+            # Val/test and single-window episodes are always deterministic.
+            t0 = 0
+        else:
+            # Per-index seed: same idx → same window every epoch, different
+            # indices → different windows.  Supports overfit testing with any
+            # value of max_samples (not just 1).
+            rng = random.Random(self.cfg.seed + idx)
+            t0 = rng.randint(0, t0_max)
+        all_indices = [t0 + j * stride for j in range(total)]
+        frame_indices = all_indices[:n]   # context/input frames
+        future_indices = all_indices[n:]  # prediction target frames
+
         # Clamp indices to valid range (0 .. T-1) if video exists
-        if vid_path.is_file() and T_vid > 0:
-            frame_indices = [min(i, T_vid - 1) for i in frame_indices]
+        if vid_path.is_file() and T > 0:
+            frame_indices = [min(i, T - 1) for i in frame_indices]
+            future_indices = [min(i, T - 1) for i in future_indices]
+
         if not vid_path.is_file():
             logger.warning(f"Video missing: {vid_path} – using dummy frames")
             images = self._generate_dummy_frames(n)
-            frame_indices = list(range(n))   # dummy indices
+            future_frames = self._generate_dummy_frames(p)
+            frame_indices = list(range(n))
         else:
-            frame_tensors = self._read_frames_at_indices(vid_path, frame_indices)
-            images = torch.stack(frame_tensors, dim=0)
-        #frame_tensors = self._read_frames_at_indices(vid_path, frame_indices)
-        #images = torch.stack(frame_tensors, dim=0)  # [N, 3, H, W]
+            frame_tensors = self._read_frames_at_indices(vid_path, frame_indices + future_indices)
+            images = torch.stack(frame_tensors[:n], dim=0)           # [n, 3, H, W]
+            future_frames = torch.stack(frame_tensors[n:], dim=0)    # [p, 3, H, W]
 
         user_body, assistant_body = self._build_text(meta, num_images=n)
         input_ids, attention_mask, labels = self._tokenise_turns(user_body, assistant_body)
@@ -513,6 +699,7 @@ class AiroaMomaDataset(Dataset):
 
         return {
             "images": images,
+            "future_frames": future_frames,   # [p, 3, H, W] — prediction targets
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
@@ -537,9 +724,11 @@ class AiroaMomaDataset(Dataset):
         D_a = self.cfg.action_dim
         D_s = self.cfg.state_dim
         if state_traj is None:
-            dummy_states = torch.randn(n, D_s)
-            dummy_actions = torch.randn(max(0, n-1), D_a)
-            # masks = 1 means they will be used in loss
+            # Use fixed seed so dummy tensors are identical every call (important when
+            # max_samples=1 and there are no .npy state files).
+            gen = torch.Generator().manual_seed(42)
+            dummy_states = torch.randn(n, D_s, generator=gen)
+            dummy_actions = torch.randn(max(0, n - 1), D_a, generator=gen)
             state_mask = torch.ones(n, dtype=torch.long)
             action_mask = torch.ones(dummy_actions.shape[0], dtype=torch.long)
             # truncation
@@ -606,6 +795,7 @@ def build_airoa_moma_dataloader(
     action_dim: int = 32,
     state_dim: int = 32,
     num_sample_frames: int = 8,
+    num_predict_frames: int = 1,
     frame_stride: int = 4,
     camera: str = "head",
     split: str = "train",
@@ -619,6 +809,8 @@ def build_airoa_moma_dataloader(
 
     Args:
         data_root: Local clone root (``episodes.jsonl`` + ``videos/``).
+        num_predict_frames: Ground-truth future frames returned as ``future_frames``
+            in each batch item (separate from the ``num_sample_frames`` context frames).
     """
     cfg = AiroaMomaConfig(
         data_root=data_root,
@@ -628,6 +820,7 @@ def build_airoa_moma_dataloader(
         action_dim=action_dim,
         state_dim=state_dim,
         num_sample_frames=num_sample_frames,
+        num_predict_frames=num_predict_frames,
         frame_stride=frame_stride,
         camera=camera,
         max_samples=max_samples,
@@ -641,5 +834,5 @@ def build_airoa_moma_dataloader(
         num_workers=num_workers,
         collate_fn=eo_collate_fn,
         pin_memory=pin_memory,
-        drop_last=True,
+        drop_last=len(ds) > batch_size,   # never drop if there is only 1 batch
     )

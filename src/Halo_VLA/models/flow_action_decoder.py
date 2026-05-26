@@ -27,11 +27,11 @@ class FlowActionDecoder(nn.Module):
     """
     Predicts the vector field v_theta(x_t, t, condition).
     Inputs:
-        x_t : (batch, action_chunk_size)  – noisy action chunk at time t (flattened)
-        t   : (batch,) or scalar          – current time in [0,1]
-        cond: (batch, obs_dim)            – observation / condition
+        x_t : (batch, action_chunk_size)   noisy action chunk at time t (flattened)
+        t   : (batch,) or scalar           current time in [0,1]
+        cond: (batch, obs_dim)             observation / condition
     Output:
-        v   : (batch, action_chunk_size)  – predicted vector field
+        v   : (batch, action_chunk_size)   predicted vector field
     """
     def __init__(self, action_dim_flat, obs_dim, hidden_dim=1024, time_embed_dim=128):
         super().__init__()

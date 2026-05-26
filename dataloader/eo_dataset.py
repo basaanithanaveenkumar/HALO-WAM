@@ -33,6 +33,7 @@ from config.tokens import SPECIAL_TOKENS, get_all_custom_tokens, get_token, get_
 IMAGE_TOKEN = get_token("image_token")
 ACTION_TOKEN = get_token("action_token")
 STATE_TOKEN = get_token("state_token")
+WORLD_VIDEO_TOKEN = get_token("world_video_token")
 
 # ---------------------------------------------------------------------------
 # All available subsets
@@ -79,7 +80,7 @@ class EODatasetConfig:
     action_dim: int = 32   # EO-Data uses 32-dim actions (varies by embodiment)
     state_dim: int = 32
     max_images: int = 8  # max images per sample for interleaved data
-    tokenizer_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    tokenizer_name: str = "HuggingFaceTB/cosmo2-tokenizer"
     max_samples: Optional[int] = None   # limit dataset size (None = all)
     streaming: bool = False
     cache_dir: Optional[str] = None
@@ -423,6 +424,10 @@ class EODataset(Dataset):
                 text_parts.append(f"{self.cfg.human_prefix}{value}{self.cfg.turn_end}")
                 role_is_assistant.append(False)
             else:
+                # Inject <halo_world_video> before <halo_action> so the model
+                # learns to imagine the future frame before committing to an action.
+                if ACTION_TOKEN in value and WORLD_VIDEO_TOKEN not in value:
+                    value = value.replace(ACTION_TOKEN, f"{WORLD_VIDEO_TOKEN}{ACTION_TOKEN}", 1)
                 text_parts.append(f"{self.cfg.assistant_prefix}{value}{self.cfg.turn_end}")
                 role_is_assistant.append(True)
 
@@ -672,7 +677,7 @@ def eo_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         padded_attention_mask[i, :L] = attention_masks[i]
         padded_labels[i, :L] = labels_list[i]
 
-    return {
+    out = {
         "images": padded_images,                          # [B, max_N, 3, H, W]
         "image_mask": image_mask,                         # [B, max_N]
         "input_ids": padded_input_ids,                    # [B, max_text_len]
@@ -683,6 +688,13 @@ def eo_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "states": padded_states,                          # [B, max_T_state, state_dim]
         "state_mask": padded_state_mask,                  # [B, max_T_state]
     }
+
+    # Optional: future_frames from datasets that provide ground-truth prediction targets
+    # (e.g. AiroaMomaDataset with num_predict_frames > 0). Stack into [B, P, C, H, W].
+    if "future_frames" in batch[0]:
+        out["future_frames"] = torch.stack([b["future_frames"] for b in batch], dim=0)
+
+    return out
 
 
 # ---------------------------------------------------------------------------

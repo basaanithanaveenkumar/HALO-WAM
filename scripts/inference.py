@@ -77,12 +77,19 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
 def get_tokenizer(max_seq_len: int = 512):
     """Return the same tokenizer used during training."""
     from transformers import AutoTokenizer
+    from config.tokens import get_all_custom_tokens
 
     tok = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen2.5-VL-3B-Instruct", trust_remote_code=True
+        "HuggingFaceTB/cosmo2-tokenizer", trust_remote_code=True
     )
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+
+    # Add the same custom special tokens that the dataloaders add
+    to_add = [t for t in get_all_custom_tokens() if t not in tok.get_vocab()]
+    if to_add:
+        tok.add_special_tokens({"additional_special_tokens": to_add})
+
     return tok
 
 

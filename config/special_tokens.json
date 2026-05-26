@@ -2,12 +2,14 @@
     "image_token": "<image>",
     "action_token": "<halo_action>",
     "state_token": "<state>",
+    "world_video_token": "<halo_world_video>",
     "token_ids": {
-        "image_token_id": 151665,
-        "action_token_id": 151666,
-        "state_token_id": 151667
+        "image_token_id": 49152,
+        "action_token_id": 49153,
+        "state_token_id": 49154,
+        "world_video_token_id": 49155
     },
-    "base_vocab_size": 151643,
-    "vocab_size_with_custom_tokens": 151668,
-    "tokenizer_name": "Qwen/Qwen2.5-VL-3B-Instruct"
+    "base_vocab_size": 49152,
+    "vocab_size_with_custom_tokens": 49156,
+    "tokenizer_name": "HuggingFaceTB/cosmo2-tokenizer"
 }

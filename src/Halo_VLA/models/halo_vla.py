@@ -1,3 +1,5 @@
+import logging
+
 from config import HaloVLMConfig
 from models.vit import VisTransformer
 from models.transformer import DecoderTransformer
@@ -44,7 +46,7 @@ def pool_past_frame_embeddings_for_visual_dit(
     last_idx = (N - 1 - from_end).clamp(0, N - 1)
     last_idx = torch.where(n_slots > 0, last_idx, torch.zeros_like(last_idx))
 
-    idx = torch.arange(N, device=device, dtype=dtype).view(1, N).expand(B, N)
+    idx = torch.arange(N, device=device, dtype=torch.long).view(1, N).expand(B, N)
     past_mask = mask * (idx < last_idx.unsqueeze(1))
     denom = past_mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
     out = (frame_stack * past_mask.unsqueeze(-1)).sum(dim=1) / denom
@@ -82,10 +84,10 @@ class HaloVLM(nn.Module):
             moe_num_routed_experts=network_config.moe_num_routed_experts,
             moe_top_k=network_config.moe_top_k,
             moe_num_shared_experts=network_config.moe_num_shared_experts,
+            gradient_checkpointing=getattr(network_config, "gradient_checkpointing", True),
         )
         self.token_emb = nn.Embedding(network_config.vocab_size, network_config.emb_dim)
         self.pos_embed = nn.Embedding(network_config.max_position_embeddings, network_config.emb_dim)
-        self.layer_norm = nn.LayerNorm(network_config.emb_dim)
         self.lm_head = LMHead(hidden_size=network_config.emb_dim, vocab_size=network_config.vocab_size)
         self.image_projector = ImageProjector(
             vision_dim=network_config.proj_vision_dim or network_config.emb_dim,
@@ -111,7 +113,8 @@ class HaloVLM(nn.Module):
         # --- DiT visual prediction (future RGB, depth, optical flow) ---
         self.enable_visual_dit = getattr(network_config, "enable_visual_dit", True)
         if self.enable_visual_dit:
-            self.visual_predictor = VisualDiTPredictor(network_config)
+            n_pred = getattr(network_config, "num_visual_predict_frames", 1)
+            self.visual_predictor = VisualDiTPredictor(network_config, num_predict_frames=n_pred)
         else:
             self.visual_predictor = None
 
@@ -141,16 +144,18 @@ class HaloVLM(nn.Module):
         Forward pass with interleaved multi-image, state-injection, and
         action-decoding support.
 
-        The input_ids sequence contains three kinds of special tokens:
+        The input_ids sequence contains four kinds of special tokens:
           • <image>  (image_token_id)  — replaced by ViT patch embeddings
           • <state>  (state_token_id)  — replaced by StateEncoder output
           • <halo_action> (action_token_id) — used *after* the transformer to
-            extract hidden states for ActionDecoder
+            extract hidden states for the flow matching action decoder
+          • <halo_world_video> (world_video_token_id) — used *after* the transformer
+            to extract hidden states for conditioning the DiT video predictor
 
         Args:
             images:         [B, N_img, 3, H, W]  — N_img images per sample.
-            input_ids:      [B, seq_len]          — token ids with <image>,
-                            <state>, and <halo_action> placeholders.
+            input_ids:      [B, seq_len]          — token ids with <image>, <state>,
+                            <halo_action>, and <halo_world_video> placeholders.
             attention_mask: [B, seq_len]          — 1 for real tokens, 0 pad.
             states:         [B, N_state, state_dim] — proprioceptive states,
                             one per <state> token.
@@ -159,24 +164,28 @@ class HaloVLM(nn.Module):
                             decoder states at image-patch positions (same order as ``images``).
 
         Returns:
-            logits:         [B, total_len, vocab_size] — next-token logits.
-            action_hiddens: [B, n_action_tokens, emb_dim]
-                            — transformer hidden states at <halo_action> positions,
-                            used as conditioning for the flow matching decoder.
-                            None if no <halo_action> tokens are present.
-            visual_context_emb: [B, emb_dim] or None — pooled **decoder** hidden states
-                            at the same image-patch positions (after transformer + final
-                            LayerNorm, before ``lm_head``): per-frame mean over patches,
-                            then mean over **past** valid frames (before the last valid).
-                            None if visual DiT is disabled.
+            logits:                    [B, total_len, vocab_size] — next-token logits.
+            action_hiddens:            [B, n_action_tokens, emb_dim]
+                                       — transformer hidden states at <halo_action>
+                                       positions; conditioning for the flow decoder.
+                                       None if no <halo_action> tokens are present.
+            visual_context_emb:        [B, emb_dim] or None — pooled decoder hidden
+                                       states at image-patch positions (post-transformer,
+                                       pre-lm_head); past-frame mean for DiT conditioning.
+                                       None if visual DiT is disabled.
+            world_video_query_hiddens: [B, n_world_video_tokens, emb_dim] or None
+                                       — transformer hidden states at <halo_world_video>
+                                       positions; used as query conditioning for the DiT
+                                       video predictor. None if no such tokens present.
         """
 
         B = input_ids.size(0)
         device = input_ids.device
         network_config = self.config
-        image_token_id = network_config.image_token_id    # e.g. 151665
-        state_token_id = network_config.state_token_id    # e.g. 151667
-        action_token_id = network_config.action_token_id  # e.g. 151666
+        image_token_id = network_config.image_token_id          # e.g. 151665
+        state_token_id = network_config.state_token_id          # e.g. 151667
+        action_token_id = network_config.action_token_id        # e.g. 151666
+        world_video_token_id = network_config.world_video_token_id  # e.g. 151668
 
         # ------------------------------------------------------------------ #
         # 1. IMAGES — count <image> tokens, encode each image through ViT,
@@ -193,7 +202,10 @@ class HaloVLM(nn.Module):
             proj_i = self.image_projector(feat_i)              # [B, num_patches, emb_dim]
             all_img_proj.append(proj_i)
 
-        img_proj = torch.cat(all_img_proj, dim=1)              # [B, N_img*num_patches, emb_dim]
+        if all_img_proj:
+            img_proj = torch.cat(all_img_proj, dim=1)          # [B, N_img*num_patches, emb_dim]
+        else:
+            img_proj = torch.empty(B, 0, network_config.emb_dim, device=device)
         num_prepended = img_proj.size(1)                       # image tokens before text
 
         # ------------------------------------------------------------------ #
@@ -220,7 +232,12 @@ class HaloVLM(nn.Module):
         #    correspond to <image> or <state> placeholders (their actual
         #    information comes from the encoders above).
         # ------------------------------------------------------------------ #
-        special_mask = (input_ids != image_token_id) & (input_ids != state_token_id)
+        # Zero out image and state placeholder positions; action and world_video tokens
+        # keep their vocab embeddings so the transformer sees a meaningful signal there.
+        special_mask = (
+            (input_ids != image_token_id)
+            & (input_ids != state_token_id)
+        )
         text_embeds = self.token_emb(input_ids)                # [B, seq_len, emb_dim]
         text_embeds = text_embeds * special_mask.unsqueeze(-1)  # zero out placeholders
 
@@ -254,9 +271,12 @@ class HaloVLM(nn.Module):
         # ------------------------------------------------------------------ #
         # 7. DECODER TRANSFORMER — causal self-attention + MoE FFN.
         # ------------------------------------------------------------------ #
-        print(f"[HaloVLM] Sequence length to decoder: {combined_embeds.size(1)}")
-        transformer_out = self.decoder_transformer(combined_embeds)
-        transformer_out = self.layer_norm(transformer_out)
+        # Build full padding mask covering prepended image patches + text tokens.
+        # Image patch slots are always valid (ones); text mask comes from the caller.
+        img_pad = torch.ones(B, num_prepended, device=device, dtype=attention_mask.dtype)
+        pad_mask_full = torch.cat([img_pad, attention_mask], dim=1)  # [B, total_len]
+
+        transformer_out = self.decoder_transformer(combined_embeds, pad_mask=pad_mask_full)
 
         # --- Visual DiT conditioning: same **positions** as prepended image patches,
         #     but **after** transformer blocks (and final LN), **before** lm_head.
@@ -316,10 +336,40 @@ class HaloVLM(nn.Module):
             # These serve as conditioning vectors for the flow decoder.
             action_hiddens = torch.stack(action_hidden_list, dim=0)
         else:
-            import logging
             logging.warning("action_hiddens is None: No <halo_action> tokens found in input_ids.")
 
-        return logits, action_hiddens, visual_context_emb
+        # ------------------------------------------------------------------ #
+        # 10. WORLD VIDEO QUERY HIDDEN STATES — find <halo_world_video> token
+        #     positions in the *original* input_ids (offset by the prepended
+        #     image patches) and extract the transformer hidden states there.
+        #     These serve as query embeddings for conditioning the DiT video
+        #     predictor, analogous to action_hiddens for the flow decoder.
+        #
+        #     world_video_query_hiddens → [B, n_world_video_tokens, emb_dim]
+        #     Returns None if no <halo_world_video> tokens are present.
+        # ------------------------------------------------------------------ #
+        world_video_mask = (input_ids == world_video_token_id)      # [B, seq_len]
+        n_world_video_tokens = world_video_mask.sum(dim=1).max().item()
+
+        world_video_query_hiddens = None
+        if n_world_video_tokens > 0:
+            wv_hidden_list = []
+            for b in range(B):
+                wv_positions = world_video_mask[b].nonzero(as_tuple=True)[0]
+                wv_positions = wv_positions + num_prepended
+                hiddens = transformer_out[b, wv_positions]          # [n_wv, emb_dim]
+                if hiddens.size(0) < n_world_video_tokens:
+                    pad = torch.zeros(
+                        n_world_video_tokens - hiddens.size(0), network_config.emb_dim,
+                        device=device,
+                    )
+                    hiddens = torch.cat([hiddens, pad], dim=0)
+                wv_hidden_list.append(hiddens)
+
+            # world_video_query_hiddens: [B, n_world_video_tokens, emb_dim]
+            world_video_query_hiddens = torch.stack(wv_hidden_list, dim=0)
+
+        return logits, action_hiddens, visual_context_emb, world_video_query_hiddens
 
     # ------------------------------------------------------------------ #
     # Flow Matching — training loss
@@ -372,6 +422,23 @@ class HaloVLM(nn.Module):
         # Reshape: [B, n_act, chunk*act_dim]
         x_1 = targets.view(B, n_act, flat_dim).view(B * n_act, flat_dim)
 
+        # --- Build loss mask from action_mask_seq: [B*n_act, flat_dim] ---
+        # Truncate or pad mask to T_need timesteps, then expand to flat_dim.
+        T_mask = action_mask_seq.size(1)
+        if T_mask >= T_need:
+            mask_seq = action_mask_seq[:, :T_need].to(device=device, dtype=x_1.dtype)
+        else:
+            mask_pad = torch.zeros(B, T_need - T_mask, device=device, dtype=x_1.dtype)
+            mask_seq = torch.cat([action_mask_seq.to(device=device, dtype=x_1.dtype), mask_pad], dim=1)
+        # [B, T_need] → [B, n_act, chunk] → [B*n_act, chunk] → [B*n_act, flat_dim]
+        loss_mask = (
+            mask_seq.view(B, n_act, chunk)
+                    .reshape(B * n_act, chunk)
+                    .unsqueeze(-1)
+                    .expand(-1, -1, act_dim)
+                    .reshape(B * n_act, flat_dim)
+        )
+
         # --- Condition vector: flatten to [B*n_act, emb_dim] ---
         # Each <halo_action> token's transformer hidden state becomes an
         # independent conditioning vector for the flow network.  By reshaping
@@ -416,12 +483,11 @@ class HaloVLM(nn.Module):
         # what we supervise the network to predict.
         v_target = x_1 - x_0
 
-        # --- MSE loss ---
-        # Mean squared error between the predicted and true velocity fields.
-        # Minimising this objective trains the flow decoder to learn the
-        # conditional vector field that transports N(0,I) to the action
-        # distribution conditioned on the transformer's representation.
-        loss = F.mse_loss(v_pred, v_target)
+        # --- Masked MSE loss ---
+        # Exclude padded action timesteps (loss_mask == 0) so padding does not
+        # corrupt the velocity-field gradients.
+        denom = loss_mask.sum().clamp(min=1.0)
+        loss = ((v_pred - v_target).pow(2) * loss_mask).sum() / denom
         return loss
 
     # ------------------------------------------------------------------ #
@@ -521,53 +587,61 @@ class HaloVLM(nn.Module):
         images: torch.Tensor,
         image_mask: torch.Tensor | None = None,
         visual_context_emb: torch.Tensor | None = None,
+        world_video_query_hiddens: torch.Tensor | None = None,
+        future_frames: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Train the frame / depth / flow DiT heads on consecutive frames.
+        Train the DiT video-prediction head to predict frames beyond the observed context.
 
-        When ``visual_context_emb`` is provided (typically the third return of
-        ``forward``), each sample's DiT conditioning is that row — pooled **decoder**
-        hidden states at image-patch positions over **past** frames only (post-transformer,
-        pre-``lm_head``).
+        ``images`` are the N context frames already seen by the model (all used as input).
+        ``future_frames`` are the P ground-truth frames the DiT must predict.
+        ``visual_context_emb`` (pooled decoder hidden states at image positions) conditions
+        the cross-attention in RGBFramePredictor; ``world_video_query_hiddens`` optionally
+        replaces the learnable world_action_tokens as cross-attn queries.
 
         Args:
-            images:      [B, N, 3, H, W]
-            image_mask:  [B, N] optional — 1 for real slots; uses last two *valid* frames.
-            visual_context_emb: [B, emb_dim] — from ``forward`` (decoder image
-                            tokens); required.
+            images:                    [B, N, 3, H, W] — context frames (model input).
+            image_mask:                [B, N] optional — 1 for real slots, 0 for pad.
+            visual_context_emb:        [B, emb_dim] — pooled decoder hidden states
+                                       (third return of ``forward``); DiT conditioning.
+            world_video_query_hiddens: [B, n_wv, emb_dim] optional — fourth return of
+                                       ``forward``; cross-attn queries for the DiT.
+            future_frames:             [B, P, 3, H, W] optional — ground-truth future
+                                       frames to predict. Returned as a separate batch
+                                       key by dataloaders that support it (e.g. MoMa).
+                                       If None, no visual loss is computed.
 
         Returns:
-            Scalar loss (0 if heads disabled or no sample has ≥2 valid frames).
+            Scalar loss (0.0 if DiT disabled or future_frames is None).
         """
         if self.visual_predictor is None:
             return torch.tensor(0.0, device=images.device)
 
+        if future_frames is None:
+            return torch.tensor(0.0, device=images.device)
+
         if visual_context_emb is None:
             raise ValueError(
-                "visual_context_emb is mandatory in compute_visual_prediction_loss when visual DiT is enabled."
+                "visual_context_emb is required by compute_visual_prediction_loss."
             )
 
-        B, N, _, _, _ = images.shape
-        device = images.device
-        losses: list[torch.Tensor] = []
+        B, P, _, H, W = future_frames.shape
+        # Number of frames to predict = number of <halo_world_video> query tokens when
+        # available, so the DiT conditioning aligns 1-to-1 with the world video tokens.
+        # Fall back to the predictor's built capacity if no query tokens are present.
+        if world_video_query_hiddens is not None:
+            n_wv = world_video_query_hiddens.size(1)
+        else:
+            n_wv = self.visual_predictor.num_predict_frames
+        p_predict = min(n_wv, P, self.visual_predictor.num_predict_frames)
+        future_targets = future_frames[:, :p_predict]  # [B, p_predict, 3, H, W]
 
-        for b in range(B):
-            n_frames = int(image_mask[b].sum().item()) if image_mask is not None else N
-            if n_frames < 2:
-                continue
-
-            num_future = min(3, n_frames - 1)
-            ctx_b = visual_context_emb[b : b + 1]
-
-            for step in range(num_future):
-                future_idx = n_frames - 1 - step
-                past = images[b : b + 1, :future_idx]
-                future = images[b : b + 1, future_idx]
-
-                out = self.visual_predictor.compute_losses(
-                    past, future, ctx_b, compute_rgb=True, compute_depth=False, compute_flow=False
-                )
-                losses.append(out["loss_visual_total"])
+        out = self.visual_predictor.compute_loss(
+            future_targets, visual_context_emb,
+            num_frames=p_predict,
+            world_video_query_hiddens=world_video_query_hiddens,
+        )
+        return out["loss_rgb_total"]
 
         if not losses:
             return torch.tensor(0.0, device=device)
@@ -579,39 +653,58 @@ class HaloVLM(nn.Module):
         past_rgb: torch.Tensor,
         visual_context_emb: torch.Tensor | None = None,
         num_frames: int = 3,
+        world_video_query_hiddens: torch.Tensor | None = None,
+        num_ode_steps: int = 20,
     ) -> dict[str, torch.Tensor]:
         """
-        Sample future RGB frames from the DiT heads autoregressively.
+        Sample future RGB frames from the DiT head autoregressively.
 
         Args:
             past_rgb: [B, T, 3, H, W] or [B, 3, H, W]
-            visual_context_emb: [B, emb_dim] — if None, computed here with the same
-                ViT + projector as ``forward`` (mean over ``past_rgb`` time).
-            num_frames: int — number of future frames to predict (default: 3)
+            visual_context_emb: [B, emb_dim] — pooled decoder hidden states (3rd return of
+                ``forward``). Recomputed from ViT if None or step > 0.
+            num_frames: number of future frames to generate (default: 3).
+            world_video_query_hiddens: [B, n_wv, emb_dim] optional — 4th return of
+                ``forward``; supplies per-frame DiT query conditioning.
+            num_ode_steps: Euler integration steps (more → better quality, slower).
 
         Returns:
-            dict with key ``rgb`` — a batch of tensors of shape [B, num_frames, 3, H, W],
-            or an empty dict if ``enable_visual_dit`` is False.
+            dict with key ``"rgb"`` → [B, num_frames, 3, H, W], or {} if DiT disabled.
         """
         if self.visual_predictor is None:
             return {}
+
+        if past_rgb.dim() == 4:
+            past_rgb = past_rgb.unsqueeze(1)
+
         H, W = past_rgb.shape[-2], past_rgb.shape[-1]
         vp = self.visual_predictor
-
         current_past = past_rgb
         preds_rgb = []
 
         for step in range(num_frames):
-            if step > 0 or visual_context_emb is None:
-                ctx_emb = self.encode_visual_context_from_past_vit(current_past)
-            else:
-                ctx_emb = visual_context_emb
+            ctx_emb = (
+                visual_context_emb
+                if step == 0 and visual_context_emb is not None
+                else self.encode_visual_context_from_past_vit(current_past)
+            )
 
-            pred_frame = vp.predict_future_rgb(current_past, H, W, ctx_emb)  # [B, 3, H, W]
+            wv_step = (
+                world_video_query_hiddens[:, step : step + 1, :]
+                if world_video_query_hiddens is not None
+                and step < world_video_query_hiddens.size(1)
+                else None
+            )
+
+            # Returns [B, 1, C, H, W]; take frame 0
+            pred_frame = vp.predict_future_frames(
+                H, W, ctx_emb,
+                num_frames=1,
+                num_steps=num_ode_steps,
+                world_video_query_hiddens=wv_step,
+            )[:, 0]  # [B, 3, H, W]
+
             preds_rgb.append(pred_frame)
-
-            if current_past.dim() == 4:
-                current_past = current_past.unsqueeze(1)
             current_past = torch.cat([current_past, pred_frame.unsqueeze(1)], dim=1)
 
         return {

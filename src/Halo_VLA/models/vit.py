@@ -1,6 +1,6 @@
 from torch import nn
 import torch
-from models.transformer import SelfAttn, HeadAttn , MultiHeadAttn,  DecoderTransformer, TransformerBlock
+from models.transformer import TransformerBlock
 class PatchEmb(nn.Module):
     def __init__(self, img_size=224, p_size=16, in_chans=3, emb_dim=1024):
         super().__init__()
@@ -22,11 +22,13 @@ class VisTransformer(nn.Module):
         self.patch_emb = PatchEmb(img_size=img_size, p_size=p_size, in_chans=in_chans, emb_dim=emb_dim)
         # learnable positional embeddings
         self.num_pat = (img_size // p_size) * (img_size // p_size)
-        self.pos_embed = nn.Parameter(torch.randn(1, self.num_pat, emb_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_pat, emb_dim))
+        nn.init.normal_(self.pos_embed, std=0.02)
         self.dropout = nn.Dropout(drop_fact)
         self.lay_norm = nn.LayerNorm(emb_dim)
         self.transformer = nn.ModuleList([
-            TransformerBlock(emb_dim=emb_dim, num_heads=num_heads, mlp_dim=mlp_dim, drop_fact=drop_fact,causal_mask=False)
+            TransformerBlock(emb_dim=emb_dim, num_heads=num_heads, mlp_dim=mlp_dim,
+                             drop_fact=drop_fact, causal_mask=False, use_moe=False)
             for _ in range(num_layers)])      
         
     def forward(self, x):

@@ -45,6 +45,7 @@ def get_all_custom_tokens() -> list[str]:
         SPECIAL_TOKENS["image_token"],
         SPECIAL_TOKENS["action_token"],
         SPECIAL_TOKENS["state_token"],
+        SPECIAL_TOKENS["world_video_token"],
     ]
 
 
