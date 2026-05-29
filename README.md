@@ -18,13 +18,8 @@ Halo-VLA is a single unified model that handles **language grounding**, **robot 
 
 | Training visualisation | Diffusion (noise → frame) |
 |:---:|:---:|
-| ![Sample 0 training viz](assets/training_viz_sample0.gif) | ![Sample 0 diffusion](assets/diffusion_viz_sample0.gif) |
-| Sample 0 — context scroll → text reveal → action trajectory → predicted future frames | Sample 0 — DiT velocity-field denoising: pure noise → predicted RGB frame |
-
-| Training visualisation | Diffusion (noise → frame) |
-|:---:|:---:|
-| ![Sample 1 training viz](assets/training_viz_sample1.gif) | ![Sample 1 diffusion](assets/diffusion_viz_sample1.gif) |
-| Sample 1 — context scroll → text reveal → action trajectory → predicted future frames | Sample 1 — DiT velocity-field denoising: pure noise → predicted RGB frame |
+| ![Training visualisation](assets/training_viz_sample1.gif) | ![DiT diffusion](assets/diffusion_viz_sample1.gif) |
+| Context scroll → text reveal → action trajectory → predicted future frames | DiT velocity-field denoising: pure noise → predicted RGB frame |
 
 </div>
 
