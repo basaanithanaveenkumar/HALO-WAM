@@ -14,10 +14,17 @@ Halo-VLA is a single unified model that handles **language grounding**, **robot 
 
 <div align="center">
 
+### Checkpoint — epoch 24 000 · step 24 000
+
 | Training visualisation | Diffusion (noise → frame) |
 |:---:|:---:|
-| ![Training visualisation](assets/training_viz.gif) | ![DiT diffusion](assets/diffusion_viz.gif) |
-| Context scroll → text reveal → action trajectory → future frames | DiT velocity-field denoising: pure noise → predicted RGB frame |
+| ![Sample 0 training viz](assets/training_viz_sample0.gif) | ![Sample 0 diffusion](assets/diffusion_viz_sample0.gif) |
+| Sample 0 — context scroll → text reveal → action trajectory → predicted future frames | Sample 0 — DiT velocity-field denoising: pure noise → predicted RGB frame |
+
+| Training visualisation | Diffusion (noise → frame) |
+|:---:|:---:|
+| ![Sample 1 training viz](assets/training_viz_sample1.gif) | ![Sample 1 diffusion](assets/diffusion_viz_sample1.gif) |
+| Sample 1 — context scroll → text reveal → action trajectory → predicted future frames | Sample 1 — DiT velocity-field denoising: pure noise → predicted RGB frame |
 
 </div>
 
