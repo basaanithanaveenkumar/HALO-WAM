@@ -107,8 +107,12 @@ class DiT(nn.Module):
         )
         freq_dim = getattr(config, "dit_time_freq_dim", 256)
         self.time_embed = ScalarTimestepEmbedder(hidden_size, frequency_embedding_size=freq_dim)
-        # Additional context embedding (e.g., from HaloVLM) will be fused
-        self.context_embed = nn.Linear(config.emb_dim, hidden_size)  # assuming config.emb_dim from HaloVLM
+        # Context embedding: project then scale+shift the time embedding so the
+        # per-frame conditioning signal is multiplicatively fused rather than
+        # additively swamped by the timestep embedding.
+        self.context_embed = nn.Linear(config.emb_dim, hidden_size)
+        # Gate: sigmoid(W*ctx) element-wise scales t_emb so context actively modulates it.
+        self.context_gate  = nn.Linear(config.emb_dim, hidden_size)
         # Transformer blocks
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, self.num_heads, config.dit_mlp_ratio)
@@ -132,6 +136,8 @@ class DiT(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        # context_gate bias → 0 so sigmoid(0)=0.5: equal time/context blend at init
+        nn.init.constant_(self.context_gate.bias, 0)
         # Zero-out the unpatch embedding output layer (optional)
         nn.init.constant_(self.unpatch_embed.weight, 0)
 
@@ -159,11 +165,14 @@ class DiT(nn.Module):
             pos_embed = self.pos_embed
         x_patch = x_patch + pos_embed
 
-        # 3. Prepare conditioning vector c = time_embed(t) + context_proj
+        # 3. Prepare conditioning vector.
+        # Gate the time embedding by the context so each frame's conditioning
+        # actively modulates (rather than just shifts) the diffusion signal.
         t_emb = self.time_embed(t)   # [B, hidden_size]
         if context is not None:
-            ctx_emb = self.context_embed(context)  # [B, hidden_size]
-            c = t_emb + ctx_emb
+            gate = torch.sigmoid(self.context_gate(context))   # [B, hidden_size] ∈ (0,1)
+            ctx  = self.context_embed(context)                 # [B, hidden_size]
+            c = gate * t_emb + ctx
         else:
             c = t_emb
 

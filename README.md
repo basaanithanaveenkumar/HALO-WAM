@@ -50,6 +50,34 @@ loss = MSE(DiT(x_t, t, cond), v*)    return x  # ≈ clean action chunk
 
 The same formulation drives the **DiT world model** — it learns to denoise random noise into a predicted future video frame, conditioned on the decoded world-action tokens.
 
+### DiT world model — per-frame conditioning pipeline
+
+Each predicted future frame gets a **unique conditioning vector** built from four stacked signals:
+
+```
+world_action_tokens[frame_offset + i]
+        │
+        ▼
+  Cross-Attention ←── text embeddings (keys / values)
+        │
+        + sinusoidal frame-index embedding  (frame i vs frame j always differ)
+        │
+        + context_frame_enc(last_seen_frame)  (SVD-style pixel-level anchor)
+        │
+        ▼
+  CFG dropout (p=0.1 during training)  →  cfg_null_context
+        │
+        ▼
+  DiT adaLN: c = sigmoid(W·ctx) · t_emb + ctx_emb
+```
+
+At inference the DiT integrates via **Heun's 2nd-order ODE** (halves truncation error vs Euler) with optional **Classifier-Free Guidance** for sharper predictions.
+
+Training uses three auxiliary losses on top of the flow-matching MSE to combat blurring:
+- **VGG perceptual loss** — feature-space MSE at relu1_2 and relu2_2
+- **SSIM loss** — structural similarity on the estimated clean frame
+- **Temporal smoothness** — L2 between consecutive predicted velocity fields
+
 ---
 
 ## Project structure
@@ -136,7 +164,37 @@ Key flags:
 | `--action_dim` | 32 | Proprioceptive action dimensionality |
 | `--moma_frame_stride` | 25 | Stride between sampled video frames |
 | `--visual_loss_weight` | — | Weight on DiT frame-prediction loss |
-| `--vis_every` | — | Save visualisation GIFs every N steps |
+| `--perceptual_weight` | 0.1 | VGG perceptual loss weight (0 = off) |
+| `--ssim_weight` | 0.4 | SSIM loss weight (0 = off) |
+| `--temporal_weight` | 0.2 | Temporal smoothness loss weight (0 = off) |
+| `--grad_accum_steps` | 1 | Accumulate gradients over N micro-batches; effective batch = `batch_size × grad_accum_steps` |
+| `--resume` | — | Path to checkpoint to resume from |
+| `--vis_every` | — | Save visualisation GIFs every N optimizer steps |
+
+### Memory-constrained training (gradient accumulation)
+
+Simulate a large effective batch on a single GPU by accumulating gradients across micro-batches. Scale the learning rate proportionally.
+
+```bash
+# 8 GB GPU: effective batch 16 at batch_size 1
+python scripts/train.py \
+  --dataset moma --moma_data_root /path/to/moma \
+  --batch_size 1 \
+  --grad_accum_steps 16 \
+  --lr 4e-4 \
+  --epochs 20
+```
+
+### Resuming from a checkpoint
+
+```bash
+python scripts/train.py \
+  --dataset moma --moma_data_root /path/to/moma \
+  --resume checkpoints/run1/halo_vla_epoch10.pt \
+  --epochs 50
+```
+
+Restores model weights, optimizer, scheduler, and AMP scaler. Training continues from the next epoch stored in the checkpoint.
 
 ### Visualisation at inference
 
@@ -185,6 +243,16 @@ config = HaloVLMConfig(
 4. **Future frames** — GT future frame alongside the DiT's predicted future frame
 
 **Diffusion GIF** — shows the DiT world model's denoising process for a single future frame: starting from pure Gaussian noise at `t=0` and integrating forward step by step to `t=1`, where the final frame is the model's prediction of the next scene.
+
+---
+
+## Documentation
+
+Detailed developer documentation lives in [`docs/`](docs/):
+
+| Document | Contents |
+|---|---|
+| [`docs/world_model.md`](docs/world_model.md) | Full technical write-up of the DiT world model — per-frame conditioning, CFG, Heun solver, auxiliary losses, and bug fixes |
 
 ---
 

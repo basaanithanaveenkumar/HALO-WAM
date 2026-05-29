@@ -30,6 +30,7 @@ from config import HaloVLMConfig
 from models.halo_vla import HaloVLM
 from dataloader.eo_dataset import build_eo_dataloader
 from dataloader.airoa_moma_dataset import build_airoa_moma_dataloader
+from dataloader.droid_dataset import build_droid_dataloader
 from utils import log_module_parameters
 from scripts.visualize import (
     unnormalise_image,
@@ -153,6 +154,7 @@ def generate_training_visualization(
     fps_ctx: int = 6,
     fps_text: int = 8,
     fps_future: int = 10,
+    fps_future_frames: int = 2,
     frame_hold: int = 2,
     diffusion_steps: int = 30,
     diffusion_snapshots: int = 24,
@@ -489,9 +491,12 @@ def generate_training_visualization(
         gif_durations = []          # ms per GIF frame
 
         # Timing per GIF frame (ms).
-        ms_ctx    = max(150, 1000 // max(fps_ctx, 1))
-        ms_word   = max( 80, 1000 // max(fps_text, 1))
-        ms_future = max( 80, 1000 // max(fps_future, 1))
+        ms_ctx           = max(150, 1000 // max(fps_ctx, 1))
+        ms_word          = max( 80, 1000 // max(fps_text, 1))
+        ms_future        = max( 80, 1000 // max(fps_future, 1))
+        # Future-frame window uses its own slower clock so each predicted
+        # frame is easy to examine (default 2 fps → 500 ms per hold copy).
+        ms_future_frames = max(300, 1000 // max(fps_future_frames, 1))
 
         # ── Phase 1 : context scroll (slow) ──────────────────
         for i in range(n_imgs):
@@ -582,7 +587,7 @@ def generate_training_visualization(
 
             for _ in range(frame_hold):
                 gif_frames.append(to_rgb_array(c))
-                gif_durations.append(ms_future)
+                gif_durations.append(ms_future_frames)
 
         if not gif_frames:
             continue
@@ -664,6 +669,26 @@ def train(args):
             max_seq_len=args.max_seq_len,
             action_dim=args.action_dim,
             state_dim=args.state_dim,
+            num_predict_frames=args.num_predict_frames,
+            shuffle=True,
+            max_samples=args.max_samples,
+        )
+    elif args.dataset == "droid":
+        if not args.droid_data_root:
+            raise ValueError("--droid_data_root is required when --dataset droid")
+        train_loader = build_droid_dataloader(
+            data_root=args.droid_data_root,
+            batch_size=args.batch_size,
+            num_workers=args.moma_num_workers,
+            img_size=config.img_size,
+            max_seq_len=args.max_seq_len,
+            max_action_len=args.moma_max_action_len,
+            action_dim=args.action_dim,
+            state_dim=args.state_dim,
+            camera=args.droid_camera,
+            num_sample_frames=args.moma_num_frames,
+            num_predict_frames=args.num_predict_frames,
+            frame_stride=args.moma_frame_stride,
             shuffle=True,
             max_samples=args.max_samples,
         )
@@ -701,6 +726,28 @@ def train(args):
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- Resume from checkpoint ----
+    start_epoch = 1
+    global_step = 0
+    if args.resume:
+        ckpt_path = Path(args.resume)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        logger.info("Resuming from checkpoint: {}", ckpt_path)
+        with torch.serialization.safe_globals([HaloVLMConfig]):
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "scaler_state_dict" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        global_step = ckpt.get("global_step", 0)
+        logger.info(
+            "Resumed at epoch {} / global_step {}  (training from epoch {})",
+            ckpt.get("epoch"), global_step, start_epoch,
+        )
+
     # ---- TensorBoard ----
     tb_writer = None
     if args.tensorboard_dir:
@@ -719,15 +766,23 @@ def train(args):
 
     # ---- Training ----
     model.train()
-    global_step = 0
+    # Effective batch = batch_size × grad_accum_steps.
+    # grad_accum_steps=1 is identical to the old single-step behaviour.
+    accum_steps = max(1, args.grad_accum_steps)
+    logger.info(
+        "Gradient accumulation: {} micro-steps  →  effective batch {}",
+        accum_steps, args.batch_size * accum_steps,
+    )
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_lang_loss = 0.0
         epoch_act_loss = 0.0
         epoch_vis_loss = 0.0
         epoch_total_loss = 0.0
-        n_steps = 0
+        n_micro = 0   # micro-steps this epoch (for epoch-average denominators)
         t0 = time.time()
+
+        optimizer.zero_grad()   # reset once before accumulation window begins
 
         for step, batch in enumerate(train_loader, 1):
             images = batch["images"].to(device)              # [B, N, 3, H, W]
@@ -759,41 +814,6 @@ def train(args):
                     pad_id, pad_id_count, decoded_text,
                 )
 
-            # Forward  — returns (logits, action_hiddens)
-            # action_hiddens: [B, n_act, emb_dim] conditioning for flow decoder
-            # logits, action_hiddens, visual_context_emb = model(
-            #     images=images,
-            #     input_ids=input_ids,
-            #     attention_mask=attention_mask,
-            #     states=states,
-            #     image_mask=batch.get("image_mask"),
-            # )
-
-            # # Number of prepended image-patch tokens (for loss alignment)
-            # num_images = (input_ids == config.image_token_id).sum(dim=1).max().item()
-            # num_patches = (config.img_size // config.patch_size) ** 2
-            # num_prepended = num_images * num_patches
-
-            # # Losses
-            # lang_loss = compute_language_loss(logits, labels, num_prepended)
-            # # Flow matching loss — replaces MLP action MSE loss
-            # act_loss = model.compute_flow_loss(action_hiddens, actions, action_mask)
-            # vis_loss = model.compute_visual_prediction_loss(
-            #     images, batch.get("image_mask"), visual_context_emb,
-            # )
-            # total_loss = (
-            #     lang_loss
-            #     + args.action_loss_weight * act_loss
-            #     + visual_loss_weight * vis_loss
-            # )
-
-            # # Backward
-            # optimizer.zero_grad()
-            # total_loss.backward()
-            # if args.grad_clip > 0:
-            #     nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            # optimizer.step()
-            # scheduler.step()
             # --- Mixed precision forward pass ---
             with autocast("cuda"):
                 logits, action_hiddens, visual_context_emb, world_video_query_hiddens = model(
@@ -813,10 +833,13 @@ def train(args):
                 future_frames = batch.get("future_frames")
                 if future_frames is not None:
                     future_frames = future_frames.to(device)
-                vis_loss = model.compute_visual_prediction_loss(
+                vis_loss, vis_subloss = model.compute_visual_prediction_loss(
                     images, batch.get("image_mask"), visual_context_emb,
                     world_video_query_hiddens=world_video_query_hiddens,
                     future_frames=future_frames,
+                    perceptual_weight=args.perceptual_weight,
+                    ssim_weight=args.ssim_weight,
+                    temporal_weight=args.temporal_weight,
                 )
                 total_loss = (
                     lang_loss
@@ -824,68 +847,85 @@ def train(args):
                     + visual_loss_weight * vis_loss
                 )
 
-            # --- Backward with scaler ---
-            optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
+            # --- Backward: scale loss so that accumulated gradients equal the
+            #     average over the full effective batch, not the sum.
+            scaler.scale(total_loss / accum_steps).backward()
 
-            # Gradient clipping (must unscale first)
-            if args.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-            scaler.step(optimizer)
-            scaler.update()          # updates the scaler for next iteration
-            scheduler.step()         # step scheduler after optimizer step
-
-            global_step += 1
-            n_steps += 1
-            epoch_lang_loss += lang_loss.item()
-            epoch_act_loss += act_loss.item()
-            epoch_vis_loss += vis_loss.item()
+            # Track per-micro-step stats (unscaled loss so epoch avg stays readable)
+            n_micro += 1
+            epoch_lang_loss  += lang_loss.item()
+            epoch_act_loss   += act_loss.item()
+            epoch_vis_loss   += vis_loss.item()
             epoch_total_loss += total_loss.item()
 
-            # Logging
-            if step % args.log_every == 0:
-                lr = optimizer.param_groups[0]["lr"]
-                logger.info(
-                    "Epoch {} | Step {}/{} | lang={:.4f}  act={:.4f}  vis={:.4f}  total={:.4f} | lr={:.2e}",
-                    epoch, step, len(train_loader),
-                    lang_loss.item(), act_loss.item(), vis_loss.item(), total_loss.item(), lr,
-                )
+            # --- Optimizer step: only every accum_steps micro-steps (or at epoch end) ---
+            is_last_batch = (step == len(train_loader))
+            if step % accum_steps == 0 or is_last_batch:
+                # Gradient clipping (must unscale before clipping)
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-            if tb_writer is not None:
-                lr = optimizer.param_groups[0]["lr"]
-                tb_writer.add_scalar("loss/lang", lang_loss.item(), global_step)
-                tb_writer.add_scalar("loss/action_flow", act_loss.item(), global_step)
-                tb_writer.add_scalar("loss/visual_dit", vis_loss.item(), global_step)
-                tb_writer.add_scalar("loss/total", total_loss.item(), global_step)
-                tb_writer.add_scalar("optim/lr", lr, global_step)
-                tb_writer.add_scalar("epoch", epoch, global_step)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
 
-                if args.tb_image_every > 0 and global_step % args.tb_image_every == 0:
-                    # First sample in batch: strip of frames [N,3,H,W] in [0,1] for TB
-                    grid = images[0, : min(8, images.size(1))].detach().cpu()
-                    grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
-                    tb_writer.add_images(
-                        "train/input_frames", grid, global_step, dataformats="NCHW"
+                global_step += 1
+
+                # Logging (keyed to optimizer steps via global_step)
+                if global_step % args.log_every == 0:
+                    lr = optimizer.param_groups[0]["lr"]
+                    cfm  = vis_subloss.get("loss_rgb_cfm",        vis_loss).item()
+                    perc = vis_subloss.get("loss_rgb_perceptual",  torch.tensor(0.0)).item()
+                    ssim = vis_subloss.get("loss_rgb_ssim",        torch.tensor(0.0)).item()
+                    temp = vis_subloss.get("loss_rgb_temporal",    torch.tensor(0.0)).item()
+                    logger.info(
+                        "Epoch {} | Step {}/{} | lang={:.4f}  act={:.4f}  "
+                        "vis={:.4f}(cfm={:.4f} perc={:.4f} ssim={:.4f} temp={:.4f})  "
+                        "total={:.4f} | lr={:.2e}",
+                        epoch, step, len(train_loader),
+                        lang_loss.item(), act_loss.item(),
+                        vis_loss.item(), cfm, perc, ssim, temp,
+                        total_loss.item(), lr,
                     )
 
-            # Visualisation GIFs
-            if args.vis_every > 0 and global_step % args.vis_every == 0:
-                generate_training_visualization(
-                    model=model, batch=batch, tokenizer=tokenizer, config=config,
-                    device=device, output_dir=ckpt_dir, global_step=global_step,
-                    epoch=epoch, max_videos=args.vis_max_videos, min_frames=args.vis_min_frames,
-                )
-                
+                if tb_writer is not None:
+                    lr = optimizer.param_groups[0]["lr"]
+                    tb_writer.add_scalar("loss/lang", lang_loss.item(), global_step)
+                    tb_writer.add_scalar("loss/action_flow", act_loss.item(), global_step)
+                    tb_writer.add_scalar("loss/visual_dit", vis_loss.item(), global_step)
+                    for k, v in vis_subloss.items():
+                        tb_writer.add_scalar(f"loss/{k}", v.item(), global_step)
+                    tb_writer.add_scalar("loss/total", total_loss.item(), global_step)
+                    tb_writer.add_scalar("optim/lr", lr, global_step)
+                    tb_writer.add_scalar("epoch", epoch, global_step)
+
+                    if args.tb_image_every > 0 and global_step % args.tb_image_every == 0:
+                        # First sample in batch: strip of frames [N,3,H,W] in [0,1] for TB
+                        grid = images[0, : min(8, images.size(1))].detach().cpu()
+                        grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
+                        tb_writer.add_images(
+                            "train/input_frames", grid, global_step, dataformats="NCHW"
+                        )
+
+                # Visualisation GIFs
+                if args.vis_every > 0 and global_step % args.vis_every == 0:
+                    generate_training_visualization(
+                        model=model, batch=batch, tokenizer=tokenizer, config=config,
+                        device=device, output_dir=ckpt_dir, global_step=global_step,
+                        epoch=epoch, max_videos=args.vis_max_videos, min_frames=args.vis_min_frames,
+                        fps_future_frames=args.vis_fps_future_frames,
+                    )
+
 
 
         # End of epoch summary
-        n = max(n_steps, 1)   # guard against empty loader (e.g. max_samples=1 + drop_last)
+        n = max(n_micro, 1)
         elapsed = time.time() - t0
         logger.info(
-            "=== Epoch {} done in {:.1f}s  steps={}  | avg lang={:.4f}  act={:.4f}  vis={:.4f}  total={:.4f} ===",
-            epoch, elapsed, n_steps,
+            "=== Epoch {} done in {:.1f}s  micro-steps={}  opt-steps={}  | avg lang={:.4f}  act={:.4f}  vis={:.4f}  total={:.4f} ===",
+            epoch, elapsed, n_micro, global_step,
             epoch_lang_loss / n, epoch_act_loss / n, epoch_vis_loss / n, epoch_total_loss / n,
         )
 
@@ -907,6 +947,7 @@ def train(args):
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                     "config": config,
                 },
                 tmp_path,
@@ -942,7 +983,22 @@ def parse_args():
         "--dataset",
         choices=("eo", "moma"),
         default="eo",
-        help="eo: EO-Data1.5M; moma: local AIRoA MoMa clone (see dataloader/airoa_moma_dataset.py)",
+        help="eo: EO-Data1.5M; moma: local AIRoA MoMa clone; droid: lerobot/droid_100 clone",
+    )
+    p.add_argument(
+        "--droid_data_root",
+        default=None,
+        help="Path to local lerobot/droid_100 clone. Required for --dataset droid.",
+    )
+    p.add_argument(
+        "--droid_camera",
+        default="observation.images.exterior_image_1_left",
+        choices=(
+            "observation.images.exterior_image_1_left",
+            "observation.images.exterior_image_2_left",
+            "observation.images.wrist_image_left",
+        ),
+        help="Which DROID camera view to use for image frames.",
     )
     p.add_argument(
         "--moma_data_root",
@@ -985,12 +1041,37 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Accumulate gradients over N micro-steps before each optimizer update. "
+             "Effective batch = batch_size × grad_accum_steps.",
+    )
     p.add_argument("--action_loss_weight", type=float, default=1.0)
     p.add_argument(
         "--visual_loss_weight",
         type=float,
         default=None,
         help="Weight for DiT frame/depth/flow loss (default: config.visual_loss_weight)",
+    )
+    p.add_argument(
+        "--perceptual_weight",
+        type=float,
+        default=0.1,
+        help="Weight for VGG perceptual loss inside vis loss (0 = disabled)",
+    )
+    p.add_argument(
+        "--ssim_weight",
+        type=float,
+        default=0.4,
+        help="Weight for SSIM loss inside vis loss (0 = disabled)",
+    )
+    p.add_argument(
+        "--temporal_weight",
+        type=float,
+        default=0.2,
+        help="Weight for inter-frame temporal smoothness loss (0 = disabled)",
     )
 
     # Device
@@ -1002,6 +1083,15 @@ def parse_args():
     p.add_argument("--keep_ckpts", type=int, default=3,
                     help="Keep only the last N checkpoints (0 = keep all)")
     p.add_argument("--ckpt_dir", default="checkpoints")
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to a checkpoint (.pt) to resume from. Restores model weights, "
+             "optimizer, scheduler, scaler, and global_step. Training continues "
+             "from the next epoch after the one stored in the checkpoint.",
+    )
     p.add_argument(
         "--tensorboard_dir",
         type=str,
@@ -1028,6 +1118,8 @@ def parse_args():
                     help="Max videos per visualisation round")
     p.add_argument("--vis_min_frames", type=int, default=3,
                     help="Only visualise samples with >= N frames")
+    p.add_argument("--vis_fps_future_frames", type=int, default=2,
+                    help="FPS for the future-frame prediction window in training GIFs (lower = slower)")
 
     return p.parse_args()
 

@@ -41,11 +41,110 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from models.DiT import DiT
+
+
+# ---------------------------------------------------------------------------
+# Frame index positional embedding
+# ---------------------------------------------------------------------------
+def _frame_pos_embedding(frame_indices: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Sinusoidal embedding for frame indices, shape [N, dim].
+    Gives each predicted frame a unique, smoothly-varying conditioning offset
+    so the DiT can distinguish frame 0 from frame 4 even when world_action_tokens
+    are similar early in training.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -torch.arange(half, dtype=torch.float32, device=frame_indices.device)
+        * (math.log(10000.0) / max(half - 1, 1))
+    )
+    args = frame_indices.float().unsqueeze(1) * freqs.unsqueeze(0)  # [N, half]
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)    # [N, dim]
+
+
+# ---------------------------------------------------------------------------
+# Perceptual loss (VGG feature matching)
+# ---------------------------------------------------------------------------
+class _VGGPerceptualLoss(nn.Module):
+    """Lightweight VGG-based perceptual loss using relu1_2 and relu2_2 features."""
+
+    def __init__(self):
+        super().__init__()
+        try:
+            import torchvision.models as tvm
+            vgg = tvm.vgg16(weights=tvm.VGG16_Weights.IMAGENET1K_V1)
+        except TypeError:
+            import torchvision.models as tvm
+            vgg = tvm.vgg16(pretrained=True)
+        # relu1_2 = layers 0-3, relu2_2 = layers 0-8
+        features = vgg.features
+        self.slice1 = nn.Sequential(*list(features.children())[:4]).eval()
+        self.slice2 = nn.Sequential(*list(features.children())[4:9]).eval()
+        for p in self.parameters():
+            p.requires_grad_(False)
+        # ImageNet mean/std for normalisation (VGG expects it)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_n, tgt_n = self._norm(pred.clamp(0, 1)), self._norm(target.clamp(0, 1))
+        f1_p, f1_t = self.slice1(pred_n), self.slice1(tgt_n)
+        f2_p, f2_t = self.slice2(f1_p),   self.slice2(f1_t)
+        return F.mse_loss(f1_p, f1_t) + F.mse_loss(f2_p, f2_t)
+
+
+# Module-level singleton — built lazily so import doesn't trigger torchvision download.
+_vgg_loss: Optional[_VGGPerceptualLoss] = None
+
+
+def _get_vgg_loss(device: torch.device) -> _VGGPerceptualLoss:
+    global _vgg_loss
+    if _vgg_loss is None:
+        try:
+            _vgg_loss = _VGGPerceptualLoss()
+        except Exception:
+            return None  # type: ignore[return-value]
+    return _vgg_loss.to(device)
+
+
+# ---------------------------------------------------------------------------
+# SSIM loss
+# ---------------------------------------------------------------------------
+def _ssim_loss(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    """1 - SSIM, averaged over the batch. pred/target in [0, 1], shape [B, C, H, W]."""
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    # Gaussian kernel
+    sigma = 1.5
+    coords = torch.arange(window_size, dtype=pred.dtype, device=pred.device) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    kernel = (g.unsqueeze(1) * g.unsqueeze(0)).unsqueeze(0).unsqueeze(0)  # [1, 1, W, W]
+    C = pred.size(1)
+    kernel = kernel.expand(C, 1, window_size, window_size).contiguous()
+    pad = window_size // 2
+
+    def mu(x):
+        return F.conv2d(x, kernel, padding=pad, groups=C)
+
+    mu_p, mu_t = mu(pred), mu(target)
+    mu_p2, mu_t2, mu_pt = mu_p ** 2, mu_t ** 2, mu_p * mu_t
+    sigma_p2  = mu(pred   ** 2) - mu_p2
+    sigma_t2  = mu(target ** 2) - mu_t2
+    sigma_pt  = mu(pred * target) - mu_pt
+
+    ssim_map = ((2 * mu_pt + C1) * (2 * sigma_pt + C2)) / \
+               ((mu_p2 + mu_t2 + C1) * (sigma_p2 + sigma_t2 + C2))
+    return 1.0 - ssim_map.mean()
 
 
 def make_dit_config(
@@ -182,6 +281,11 @@ def sample_di_t_euler(
         x = x + v * dt
     
     return x
+def F_func_temporal(v_frames: torch.Tensor) -> torch.Tensor:
+    """L2 difference between consecutive predicted velocity fields [B, F, C, H, W]."""
+    return F.mse_loss(v_frames[:, 1:], v_frames[:, :-1])
+
+
 class RGBFramePredictor(nn.Module):
     """
     Multi-frame RGB predictor using DiT with conditional flow matching.
@@ -242,7 +346,8 @@ class RGBFramePredictor(nn.Module):
         self.world_action_tokens = nn.Parameter(
             torch.empty(num_predict_frames, context_dim)
         )
-        nn.init.normal_(self.world_action_tokens, std=0.02)
+        # Higher std so tokens start distinguishable — critical for per-frame diversity.
+        nn.init.normal_(self.world_action_tokens, std=0.02 * (num_predict_frames ** 0.5))
         
         # ==================== Text-Action Cross-Attention ====================
         # Cross-attention: world_action_tokens (queries) attend to text_embeddings (keys/values)
@@ -275,6 +380,37 @@ class RGBFramePredictor(nn.Module):
         self.wv_query_proj = (
             nn.Linear(wv_in, context_dim) if wv_in != context_dim else nn.Identity()
         )
+
+        # Learnable projection for the sinusoidal frame index embedding.
+        # This adds an explicit, unambiguous per-frame signal to the conditioning
+        # vector regardless of how similar the world_action_tokens are.
+        self.frame_pos_proj = nn.Linear(context_dim, context_dim)
+
+        # ==================== Context Frame Pixel Encoder ====================
+        # Encodes the last observed (or previously predicted) frame into a vector
+        # that is added to the per-frame conditioning.  This gives the DiT direct
+        # pixel-level information about the current scene — the single biggest
+        # architectural gap vs production video diffusion models (SVD, VideoLDM).
+        #
+        # Architecture: two strided convs reduce 224→28→7, then global avg-pool
+        # to produce a [B, context_dim] summary.  Kept lightweight (no BN/skip)
+        # so it doesn't dominate the conditioning.
+        self.context_frame_enc = nn.Sequential(
+            nn.Conv2d(rgb_ch, context_dim // 4, kernel_size=8, stride=8, padding=0),
+            nn.GELU(),
+            nn.Conv2d(context_dim // 4, context_dim // 2, kernel_size=4, stride=4, padding=0),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(context_dim // 2, context_dim),
+            nn.LayerNorm(context_dim),
+        )
+        # Null token used during CFG training dropout (learned, not fixed zeros).
+        self.cfg_null_context = nn.Parameter(torch.zeros(context_dim))
+        # Randomly zero the pixel-encoder output during training so the model
+        # doesn't over-rely on perfect GT prev-frames (teacher forcing gap).
+        ctx_drop = getattr(config, "context_frame_dropout", 0.2)
+        self.context_frame_dropout = nn.Dropout(p=ctx_drop)
     
     def _create_augmented_context(
         self,
@@ -364,6 +500,9 @@ class RGBFramePredictor(nn.Module):
         text_emb: torch.Tensor,
         num_frames: int,
         world_video_query_hiddens: Optional[torch.Tensor] = None,
+        frame_offset: int = 0,
+        context_frames: Optional[torch.Tensor] = None,
+        cfg_drop_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Batched version of _create_augmented_context: processes all frames in one
@@ -373,10 +512,14 @@ class RGBFramePredictor(nn.Module):
             text_emb: [B, S, emb_dim] or [B, emb_dim]
             num_frames: number of frames to condition
             world_video_query_hiddens: [B, n_wv, emb_dim] or None
+            frame_offset: index of the first frame being predicted.
+            context_frames: [B, F, 3, H, W] or [B, 3, H, W] — the last observed
+                frame before each target frame.  Encoded and added to cond so the
+                DiT has direct pixel-level scene information (SVD-style).
+            cfg_drop_mask: [B] bool — True positions use the null context (CFG dropout).
 
         Returns:
-            [B * num_frames, emb_dim] — one conditioning vector per (batch, frame) pair,
-            in row-major order (all frames of sample 0, then all of sample 1, …).
+            [B * num_frames, emb_dim] — one conditioning vector per (batch, frame) pair.
         """
         B = text_emb.size(0)
         text_seq = text_emb.unsqueeze(1) if text_emb.dim() == 2 else text_emb  # [B, S, D]
@@ -387,10 +530,17 @@ class RGBFramePredictor(nn.Module):
             n_wv = min(num_frames, world_video_query_hiddens.size(1))
             action_query = self.wv_query_proj(world_video_query_hiddens[:, :n_wv])  # [B, n_wv, D]
             if n_wv < num_frames:
-                pad = self.world_action_tokens[n_wv:num_frames].unsqueeze(0).expand(B, -1, -1)
+                # Pad with the correct world_action_tokens (accounting for frame_offset)
+                pad_start = frame_offset + n_wv
+                pad_end = frame_offset + num_frames
+                pad_end = min(pad_end, self.num_predict_frames)
+                pad = self.world_action_tokens[pad_start:pad_end].unsqueeze(0).expand(B, -1, -1)
                 action_query = torch.cat([action_query, pad], dim=1)
         else:
-            action_query = self.world_action_tokens[:num_frames].unsqueeze(0).expand(B, -1, -1)
+            # Use the world_action_tokens for the correct frame range
+            token_start = frame_offset
+            token_end = min(frame_offset + num_frames, self.num_predict_frames)
+            action_query = self.world_action_tokens[token_start:token_end].unsqueeze(0).expand(B, -1, -1)
         # [B, num_frames, emb_dim]
 
         # Flatten to [B*F, 1, D] and [B*F, S, D] for a single batched cross-attn call
@@ -404,6 +554,39 @@ class RGBFramePredictor(nn.Module):
 
         refined = self.cross_attn_norm(attn_out.squeeze(1) + aq_flat.squeeze(1))  # [BF, D]
         cond = self.proj_norm(refined + self.cross_attn_proj(refined))             # [BF, D]
+
+        # Add a sinusoidal frame-index embedding so the DiT always gets an explicit
+        # "which frame am I predicting" signal, even when world_action_tokens are
+        # still similar early in training.
+        frame_ids = torch.arange(num_frames, device=cond.device)                  # [F]
+        frame_ids = (frame_ids + frame_offset)                                     # global idx
+        pos_emb = _frame_pos_embedding(frame_ids, cond.size(-1))                  # [F, D]
+        pos_emb = pos_emb.unsqueeze(0).expand(B, -1, -1).reshape(BF, -1)         # [BF, D]
+        cond = cond + self.frame_pos_proj(pos_emb)
+
+        # ── Context frame pixel encoding ────────────────────────────────────
+        # Encode the last observed/predicted frame so the DiT has direct pixel-level
+        # scene information, not just a pooled embedding from the VLA transformer.
+        if context_frames is not None:
+            if context_frames.dim() == 4:
+                # [B, 3, H, W] — same context for all frames in the chunk
+                cf_flat = context_frames.unsqueeze(1).expand(-1, num_frames, -1, -1, -1)
+                cf_flat = cf_flat.reshape(BF, *context_frames.shape[1:])
+            else:
+                # [B, F, 3, H, W] — per-frame context (autoregressive)
+                cf_flat = context_frames[:, :num_frames].reshape(BF, *context_frames.shape[2:])
+            ctx_feat = self.context_frame_enc(cf_flat)    # [BF, D]
+            cond = cond + self.context_frame_dropout(ctx_feat)
+
+        # ── Classifier-Free Guidance dropout ────────────────────────────────
+        # Randomly replace conditioning with a learned null vector during training.
+        # At inference, guidance_scale controls how strongly conditioning is applied.
+        if cfg_drop_mask is not None:
+            # cfg_drop_mask: [B] bool — expand to [BF]
+            drop_flat = cfg_drop_mask.unsqueeze(1).expand(-1, num_frames).reshape(BF)
+            null = self.cfg_null_context.to(cond.dtype).unsqueeze(0).expand(BF, -1)
+            cond = torch.where(drop_flat.unsqueeze(1), null, cond)
+
         return cond
 
     def compute_loss(
@@ -412,55 +595,116 @@ class RGBFramePredictor(nn.Module):
         text_emb: torch.Tensor,
         num_frames: int = 4,
         world_video_query_hiddens: Optional[torch.Tensor] = None,
+        perceptual_weight: float = 0.1,
+        ssim_weight: float = 0.1,
+        temporal_weight: float = 0.05,
+        last_context_frame: Optional[torch.Tensor] = None,
+        cfg_dropout_prob: float = 0.1,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute the training loss for multi-frame RGB prediction with text-guided action.
+        Compute training losses for multi-frame RGB prediction.
 
-        For each frame in the sequence, we compute a conditional flow matching loss,
-        using frame-specific world action tokens interacting with text embeddings via
-        cross-attention to guide the prediction.
+        In addition to flow-matching (CFM) loss, computes:
+          - Perceptual loss  : VGG feature-space MSE on the estimated clean frame
+                               x1_hat = x_t + (1-t)*v_pred  (exact when v_pred = v*)
+          - SSIM loss        : 1 - SSIM on x1_hat vs x1, penalises structural blurring
+          - Temporal loss    : L2 between consecutive predicted velocities, discourages
+                               flicker across the frame sequence
 
         Args:
-            future_rgb: [B, num_frames, 3, H, W] stack of target frames to predict.
-                       For each frame in the sequence, we compute a separate CFM loss.
-            text_emb: [B, seq_len, emb_dim] or [B, emb_dim] text embeddings from frozen encoder.
-                     These guide the world action tokens to create frame-specific conditioning.
-            num_frames: Number of frames being predicted. Should match future_rgb.size(1).
-                       Used to determine world action token selection.
-        
+            future_rgb:               [B, num_frames, 3, H, W] target frames.
+            text_emb:                 [B, S, emb_dim] or [B, emb_dim] context embedding.
+            num_frames:               frames to predict (clamped to available).
+            world_video_query_hiddens:[B, n_wv, emb_dim] or None.
+            perceptual_weight:        weight for VGG perceptual loss (0 = disabled).
+            ssim_weight:              weight for SSIM loss (0 = disabled).
+            temporal_weight:          weight for inter-frame velocity smoothness (0 = disabled).
+
         Returns:
-            Dictionary with:
-              - "loss_rgb_cfm": [1,] total CFM loss averaged over all frames
-              - "loss_rgb_total": [1,] alias for loss_rgb_cfm (for compatibility)
-        
-        Flow:
-          For each frame i in [0, num_frames):
-            1. Get world_action_tokens[i]
-            2. Cross-attend with text_emb: action_token --[attn]--> text → conditional_emb[i]
-            3. Compute CFM loss: L_i = ||v_θ(x_t, t, conditional_emb[i]) - v*||²
-            4. Sum losses and average
+            Dict with keys:
+              loss_rgb_cfm       — flow matching MSE
+              loss_rgb_perceptual— VGG perceptual loss (0 if disabled / VGG unavailable)
+              loss_rgb_ssim      — 1 - SSIM loss (0 if disabled)
+              loss_rgb_temporal  — temporal smoothness loss (0 if F < 2 or disabled)
+              loss_rgb_total     — weighted sum of all active losses
         """
         out: Dict[str, torch.Tensor] = {}
 
         if future_rgb.dim() == 4:
-            future_rgb = future_rgb.unsqueeze(1)  # [B, 3, H, W] → [B, 1, 3, H, W]
+            future_rgb = future_rgb.unsqueeze(1)
 
-        # Clamp num_frames to what is actually available
         num_frames = min(num_frames, future_rgb.size(1), self.num_predict_frames)
         future_rgb = future_rgb[:, :num_frames]
 
-        B, F, C, H, W = future_rgb.shape
+        B, nF, C, H, W = future_rgb.shape
+        device = future_rgb.device
 
-        # Build all conditioning vectors in one batched call → [B*F, emb_dim]
-        cond_all = self._create_all_frame_contexts(text_emb, F, world_video_query_hiddens)
+        # Build per-frame context frames:
+        # frame 0 → last_context_frame, frame i>0 → future_rgb[:, i-1]
+        if last_context_frame is not None:
+            prev_frames = torch.cat(
+                [last_context_frame.unsqueeze(1), future_rgb[:, :-1]], dim=1
+            )  # [B, nF, 3, H, W]
+        else:
+            prev_frames = None
 
-        # Flatten frames into the batch dimension for a single DiT forward pass
-        targets_flat = future_rgb.reshape(B * F, C, H, W)
+        # CFG dropout mask: randomly drop conditioning for some batch items
+        cfg_drop = (
+            torch.rand(B, device=device) < cfg_dropout_prob
+            if self.training and cfg_dropout_prob > 0
+            else None
+        )
 
-        loss, _, _, _ = flow_matching_velocity_loss(self.dit_rgb, targets_flat, cond_all)
+        cond_all = self._create_all_frame_contexts(
+            text_emb, nF, world_video_query_hiddens,
+            context_frames=prev_frames,
+            cfg_drop_mask=cfg_drop,
+        )
+        targets_flat = future_rgb.reshape(B * nF, C, H, W)
 
-        out["loss_rgb_cfm"] = loss
-        out["loss_rgb_total"] = loss
+        # ── Flow matching ────────────────────────────────────────────────────
+        cfm_loss, x_t, t, v_pred = flow_matching_velocity_loss(
+            self.dit_rgb, targets_flat, cond_all,
+        )
+        out["loss_rgb_cfm"] = cfm_loss
+
+        # ── Estimate clean frame: x1_hat = x_t + (1-t)*v_pred ───────────────
+        # Derivation: x_t = (1-t)*x0 + t*x1  and  v = x1 - x0
+        # → x1 = x_t + (1-t)*v  (exact when v_pred equals v*)
+        te = t.view(-1, 1, 1, 1)
+        x1_hat = (x_t + (1.0 - te) * v_pred).clamp(0, 1)
+        x1_tgt = targets_flat.clamp(0, 1)
+
+        # ── Perceptual loss ──────────────────────────────────────────────────
+        perc_loss = torch.tensor(0.0, device=device)
+        if perceptual_weight > 0:
+            vgg = _get_vgg_loss(device)
+            if vgg is not None:
+                perc_loss = vgg(x1_hat.float(), x1_tgt.float())
+        out["loss_rgb_perceptual"] = perc_loss
+
+        # ── SSIM loss ────────────────────────────────────────────────────────
+        ssim_loss = torch.tensor(0.0, device=device)
+        if ssim_weight > 0:
+            ssim_loss = _ssim_loss(x1_hat, x1_tgt)
+        out["loss_rgb_ssim"] = ssim_loss
+
+        # ── Temporal smoothness loss ─────────────────────────────────────────
+        # Penalise large velocity differences between consecutive predicted frames
+        # so the model learns smooth, consistent motion rather than per-frame jumps.
+        temp_loss = torch.tensor(0.0, device=device)
+        if temporal_weight > 0 and nF >= 2:
+            v_frames = v_pred.view(B, nF, C, H, W)          # [B, nF, C, H, W]
+            temp_loss = F_func_temporal(v_frames)
+        out["loss_rgb_temporal"] = temp_loss
+
+        total = (
+            cfm_loss
+            + perceptual_weight * perc_loss
+            + ssim_weight       * ssim_loss
+            + temporal_weight   * temp_loss
+        )
+        out["loss_rgb_total"] = total
         return out
     
     @torch.no_grad()
@@ -472,46 +716,74 @@ class RGBFramePredictor(nn.Module):
         num_frames: int = 4,
         num_steps: int = 20,
         world_video_query_hiddens: Optional[torch.Tensor] = None,
+        frame_offset: int = 0,
+        context_frame: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         """
-        Generate a sequence of future RGB frames with text-guided world action conditioning.
-
-        Each frame is generated independently using its corresponding world action token,
-        which is refined through cross-attention with text embeddings. This creates
-        frame-specific conditioning that combines temporal action dynamics with text guidance.
+        Generate future RGB frames using Heun's 2nd-order ODE solver and optional CFG.
 
         Args:
-            height: Height of the output frames in latent space.
-            width: Width of the output frames in latent space.
-            text_emb: [B, seq_len, emb_dim] or [B, emb_dim] text embeddings from frozen encoder.
-                     These guide world action tokens to create frame-specific conditioning.
-            num_frames: Number of frames to generate. Must be <= num_predict_frames.
-            num_steps: Number of ODE integration steps (higher = slower but more accurate).
-        
+            height, width: output spatial size.
+            text_emb: [B, S, emb_dim] or [B, emb_dim].
+            num_frames: frames to generate.
+            num_steps: ODE integration steps.
+            world_video_query_hiddens: [B, n_wv, emb_dim] or None.
+            frame_offset: first frame index (selects world_action_token).
+            context_frame: [B, 3, H, W] last observed frame — gives the DiT
+                pixel-level scene information (SVD-style conditioning).
+            guidance_scale: CFG scale (1.0 = no guidance, 7.5 = strong).
+
         Returns:
-            [B, num_frames, 3, height, width] generated RGB frames in latent space.
-        
-        Process per frame:
-          1. Select world_action_tokens[frame_idx]
-          2. Cross-attend with text_emb to get frame-specific conditioning
-          3. Euler integrate DiT velocity field from t=0 to t=1
-          4. Stack all frames into output tensor
+            [B, num_frames, 3, height, width].
         """
         num_frames = min(num_frames, self.num_predict_frames)
-
         B = text_emb.size(0)
         rgb_channels = getattr(self.config, "rgb_channels", 3)
 
-        # Build all conditioning vectors in one batched call → [B*F, emb_dim]
-        cond_all = self._create_all_frame_contexts(text_emb, num_frames, world_video_query_hiddens)
+        # Conditioned vectors [B*F, D]
+        cond = self._create_all_frame_contexts(
+            text_emb, num_frames, world_video_query_hiddens,
+            frame_offset=frame_offset,
+            context_frames=context_frame,
+        )
 
-        # Generate all frames with a single Euler integration pass
-        # sample_di_t_euler handles arbitrary batch sizes, so [B*F] works directly
-        generated_flat = sample_di_t_euler(
-            self.dit_rgb, cond_all, rgb_channels, height, width, num_steps=num_steps,
-        )  # [B*F, C, H, W]
+        # Unconditioned vectors for CFG (null context, no context_frame)
+        use_cfg = guidance_scale > 1.0
+        if use_cfg:
+            null_mask = torch.ones(B, dtype=torch.bool, device=text_emb.device)
+            cond_null = self._create_all_frame_contexts(
+                text_emb, num_frames, world_video_query_hiddens,
+                frame_offset=frame_offset,
+                cfg_drop_mask=null_mask,
+            )
 
-        return generated_flat.view(B, num_frames, rgb_channels, height, width)
+        BF = B * num_frames
+        x = torch.randn(BF, rgb_channels, height, width, device=text_emb.device)
+        dt = 1.0 / num_steps
+
+        for i in range(num_steps):
+            t_val = i * dt
+            t = torch.full((BF,), t_val, device=x.device)
+
+            # Conditioned velocity
+            v1 = self.dit_rgb(x, t, cond)
+
+            if use_cfg:
+                v1_null = self.dit_rgb(x, t, cond_null)
+                v1 = v1_null + guidance_scale * (v1 - v1_null)
+
+            # Heun's 2nd-order correction
+            x_next = x + v1 * dt
+            t_next = torch.full((BF,), min(t_val + dt, 1.0 - 1e-5), device=x.device)
+            v2 = self.dit_rgb(x_next, t_next, cond)
+            if use_cfg:
+                v2_null = self.dit_rgb(x_next, t_next, cond_null)
+                v2 = v2_null + guidance_scale * (v2 - v2_null)
+
+            x = x + (v1 + v2) * 0.5 * dt
+
+        return x.view(B, num_frames, rgb_channels, height, width)
 
 
 # Alias used by halo_vla.py
