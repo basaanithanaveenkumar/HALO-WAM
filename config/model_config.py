@@ -38,7 +38,7 @@ class HaloVLMConfig:
     img_size: int = 224
     patch_size: int = 16
     in_chans: int = 3
-    vit_num_layers: int = 4
+    vit_num_layers: int = 6
     vit_num_heads: int = 16
     vit_mlp_dim: int = 512
     vit_drop: float = 0.0
@@ -52,7 +52,7 @@ class HaloVLMConfig:
     # MoE (DeepseekMoE) — used inside each TransformerBlock
     use_moe: bool = True                  # False → standard MLP FFN
     moe_hid_scale: float = 1.2            # hidden dim = round(emb_dim * scale)
-    moe_num_routed_experts: int = 4
+    moe_num_routed_experts: int = 6
     moe_top_k: int = 2
     moe_num_shared_experts: int = 2
 
@@ -103,7 +103,7 @@ class HaloVLMConfig:
     dit_flow_smooth_weight: float = 0.1
     dit_depth_recon_weight: float = 1.0
     dit_flow_photo_weight: float = 0.5
-    dit_num_sample_steps: int = 50      # more Euler steps at inference → better quality
+    dit_num_sample_steps: int = 75      # more Euler steps at inference → better quality
 
     # Gradient checkpointing — recomputes activations on backward instead of storing them.
     # Saves ~40% activation memory on the decoder at ~33% extra compute cost.
@@ -111,7 +111,7 @@ class HaloVLMConfig:
 
     # HaloVLM integration: DiT RGB / depth / flow heads (``VisualDiTPredictor``)
     enable_visual_dit: bool = True      # False → omit heads (e.g. old checkpoints)
-    visual_loss_weight: float = 6.0      # increased to push more training signal into DiT head
+    visual_loss_weight: float = 8.0      # increased to push more training signal into DiT head
     # Number of future frames the DiT head is asked to predict (configurable).
     # The dataloader samples num_sample_frames (context) + num_visual_predict_frames
     # (targets) and returns them as "images" and "future_frames" respectively.

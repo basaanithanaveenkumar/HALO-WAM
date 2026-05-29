@@ -589,36 +589,22 @@ class HaloVLM(nn.Module):
         visual_context_emb: torch.Tensor | None = None,
         world_video_query_hiddens: torch.Tensor | None = None,
         future_frames: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        perceptual_weight: float = 0.1,
+        ssim_weight: float = 0.1,
+        temporal_weight: float = 0.05,
+    ) -> tuple[torch.Tensor, dict]:
         """
         Train the DiT video-prediction head to predict frames beyond the observed context.
 
-        ``images`` are the N context frames already seen by the model (all used as input).
-        ``future_frames`` are the P ground-truth frames the DiT must predict.
-        ``visual_context_emb`` (pooled decoder hidden states at image positions) conditions
-        the cross-attention in RGBFramePredictor; ``world_video_query_hiddens`` optionally
-        replaces the learnable world_action_tokens as cross-attn queries.
-
-        Args:
-            images:                    [B, N, 3, H, W] — context frames (model input).
-            image_mask:                [B, N] optional — 1 for real slots, 0 for pad.
-            visual_context_emb:        [B, emb_dim] — pooled decoder hidden states
-                                       (third return of ``forward``); DiT conditioning.
-            world_video_query_hiddens: [B, n_wv, emb_dim] optional — fourth return of
-                                       ``forward``; cross-attn queries for the DiT.
-            future_frames:             [B, P, 3, H, W] optional — ground-truth future
-                                       frames to predict. Returned as a separate batch
-                                       key by dataloaders that support it (e.g. MoMa).
-                                       If None, no visual loss is computed.
-
         Returns:
-            Scalar loss (0.0 if DiT disabled or future_frames is None).
+            (total_loss, sub_losses_dict) where sub_losses_dict contains
+            loss_rgb_cfm, loss_rgb_perceptual, loss_rgb_ssim, loss_rgb_temporal.
         """
-        if self.visual_predictor is None:
-            return torch.tensor(0.0, device=images.device)
+        zero = torch.tensor(0.0, device=images.device)
+        empty: dict = {}
 
-        if future_frames is None:
-            return torch.tensor(0.0, device=images.device)
+        if self.visual_predictor is None or future_frames is None:
+            return zero, empty
 
         if visual_context_emb is None:
             raise ValueError(
@@ -626,26 +612,31 @@ class HaloVLM(nn.Module):
             )
 
         B, P, _, H, W = future_frames.shape
-        # Number of frames to predict = number of <halo_world_video> query tokens when
-        # available, so the DiT conditioning aligns 1-to-1 with the world video tokens.
-        # Fall back to the predictor's built capacity if no query tokens are present.
         if world_video_query_hiddens is not None:
             n_wv = world_video_query_hiddens.size(1)
         else:
             n_wv = self.visual_predictor.num_predict_frames
         p_predict = min(n_wv, P, self.visual_predictor.num_predict_frames)
-        future_targets = future_frames[:, :p_predict]  # [B, p_predict, 3, H, W]
+        future_targets = future_frames[:, :p_predict]
+
+        # Last context frame = final frame of the observed window (images[:, -1] or
+        # the last real frame when image_mask is provided).
+        if image_mask is not None:
+            last_idx = (image_mask.sum(dim=1) - 1).clamp(min=0).long()  # [B]
+            last_ctx = images[torch.arange(B, device=images.device), last_idx]
+        else:
+            last_ctx = images[:, -1]  # [B, 3, H, W]
 
         out = self.visual_predictor.compute_loss(
             future_targets, visual_context_emb,
             num_frames=p_predict,
             world_video_query_hiddens=world_video_query_hiddens,
+            perceptual_weight=perceptual_weight,
+            ssim_weight=ssim_weight,
+            temporal_weight=temporal_weight,
+            last_context_frame=last_ctx,
         )
-        return out["loss_rgb_total"]
-
-        if not losses:
-            return torch.tensor(0.0, device=device)
-        return torch.stack(losses).mean()
+        return out["loss_rgb_total"], out
 
     @torch.no_grad()
     def predict_visual_future(
@@ -696,12 +687,18 @@ class HaloVLM(nn.Module):
                 else None
             )
 
+            # The pixel-level context frame: last observed frame for step 0,
+            # previously predicted frame for step > 0.
+            context_frame = current_past[:, -1]  # [B, 3, H, W]
+
             # Returns [B, 1, C, H, W]; take frame 0
             pred_frame = vp.predict_future_frames(
                 H, W, ctx_emb,
                 num_frames=1,
                 num_steps=num_ode_steps,
                 world_video_query_hiddens=wv_step,
+                frame_offset=step,
+                context_frame=context_frame,
             )[:, 0]  # [B, 3, H, W]
 
             preds_rgb.append(pred_frame)

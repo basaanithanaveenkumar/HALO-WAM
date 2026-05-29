@@ -92,6 +92,9 @@ class EODatasetConfig:
     human_prefix: str = "<|im_start|>user\n"
     assistant_prefix: str = "<|im_start|>assistant\n"
     turn_end: str = "<|im_end|>\n"
+    # Number of future frames the DiT head predicts; one <halo_world_video> token
+    # is inserted per frame so each frame gets its own transformer hidden state.
+    num_predict_frames: int = 1
     # Special token IDs (set after tokenizer init)
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -282,7 +285,19 @@ class EODataset(Dataset):
         sample = self.dataset[sample_idx]
 
         # ----- Images -----
-        images = self._process_images(sample)
+        all_images = self._process_images(sample)  # [N, 3, H, W]
+
+        # Split into context frames (model input) and future frames (DiT target).
+        # If the sequence is long enough, hold back the last `num_predict_frames`
+        # frames as prediction targets; otherwise use all frames as context only.
+        n_predict = self.cfg.num_predict_frames
+        n_total   = all_images.size(0)
+        if n_total > n_predict:
+            images        = all_images[: n_total - n_predict]   # context
+            future_frames = all_images[n_total - n_predict :]   # targets [P, 3, H, W]
+        else:
+            images        = all_images
+            future_frames = None
 
         # ----- Conversation → token ids (single user–assistant pair) -----
         input_ids, attention_mask, labels = self._process_conversation(sample, pair_idx=pair_idx)
@@ -293,8 +308,8 @@ class EODataset(Dataset):
         # ----- States -----
         states, state_mask = self._process_states(sample)
 
-        return {
-            "images": images,                 # [N, 3, H, W]
+        item = {
+            "images": images,                 # [N-P, 3, H, W]
             "input_ids": input_ids,           # [seq_len]
             "attention_mask": attention_mask,  # [seq_len]
             "labels": labels,                 # [seq_len]
@@ -305,6 +320,9 @@ class EODataset(Dataset):
             "num_images": images.size(0),
             "pad_token_id": self.cfg.pad_token_id,
         }
+        if future_frames is not None:
+            item["future_frames"] = future_frames  # [P, 3, H, W]
+        return item
 
     # ------------------------------------------------------------- images
     def _process_images(self, sample: Dict) -> torch.Tensor:
@@ -424,10 +442,12 @@ class EODataset(Dataset):
                 text_parts.append(f"{self.cfg.human_prefix}{value}{self.cfg.turn_end}")
                 role_is_assistant.append(False)
             else:
-                # Inject <halo_world_video> before <halo_action> so the model
-                # learns to imagine the future frame before committing to an action.
+                # Inject one <halo_world_video> token per predicted future frame before
+                # <halo_action> so each frame gets its own transformer hidden state for
+                # DiT conditioning.
                 if ACTION_TOKEN in value and WORLD_VIDEO_TOKEN not in value:
-                    value = value.replace(ACTION_TOKEN, f"{WORLD_VIDEO_TOKEN}{ACTION_TOKEN}", 1)
+                    wv_tokens = WORLD_VIDEO_TOKEN * self.cfg.num_predict_frames
+                    value = value.replace(ACTION_TOKEN, f"{wv_tokens}{ACTION_TOKEN}", 1)
                 text_parts.append(f"{self.cfg.assistant_prefix}{value}{self.cfg.turn_end}")
                 role_is_assistant.append(True)
 
@@ -689,10 +709,11 @@ def eo_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "state_mask": padded_state_mask,                  # [B, max_T_state]
     }
 
-    # Optional: future_frames from datasets that provide ground-truth prediction targets
-    # (e.g. AiroaMomaDataset with num_predict_frames > 0). Stack into [B, P, C, H, W].
-    if "future_frames" in batch[0]:
-        out["future_frames"] = torch.stack([b["future_frames"] for b in batch], dim=0)
+    # Optional: future_frames from datasets that provide ground-truth prediction targets.
+    # Only stack when ALL items in the batch have future_frames to avoid shape mismatches.
+    items_with_future = [b["future_frames"] for b in batch if "future_frames" in b]
+    if len(items_with_future) == B:
+        out["future_frames"] = torch.stack(items_with_future, dim=0)
 
     return out
 
@@ -711,6 +732,7 @@ def build_eo_dataloader(
     max_action_len: int = 64,
     action_dim: int = 32,
     state_dim: int = 32,
+    num_predict_frames: int = 1,
     streaming: bool = False,
     cache_dir: Optional[str] = None,
     shuffle: bool = True,
@@ -743,6 +765,7 @@ def build_eo_dataloader(
         max_action_len=max_action_len,
         action_dim=action_dim,
         state_dim=state_dim,
+        num_predict_frames=num_predict_frames,
         streaming=streaming,
         cache_dir=cache_dir,
         max_samples=kwargs.pop("max_samples", None),

@@ -252,10 +252,103 @@ def draw_header(img, phase: str, sub: str = "", accent: Tuple[int, int, int] = (
     return bar_h
 
 
+# Ordered phase labels and their accent colours for the PRAI bar.
+_PRAI_PHASES = [
+    ("01", "PERCEIVE", (96, 200, 255)),    # cyan
+    ("02", "REASON",   (160, 120, 255)),   # purple
+    ("03", "ACT",      (255, 180, 80)),    # orange
+    ("04", "IMAGINE",  (130, 235, 170)),   # green
+]
+
+# Map the phase_label used in compose_frame → PRAI index.
+_PHASE_LABEL_TO_PRAI = {
+    "CONTEXT":       0,
+    "ANSWER":        1,
+    "ACTION":        2,
+    "NOISE -> IMAGE": 3,
+}
+
+_PRAI_BAR_H = 32  # pixel height of the PRAI bar
+
+
+def draw_prai_bar(img, active_phase: int = 0) -> None:
+    """
+    Draw the Perceive → Reason → Act → Imagine progress bar directly
+    below the header strip.  ``active_phase`` is 0-based (0=PERCEIVE …
+    3=IMAGINE); that segment is visually highlighted.
+    """
+    Image, ImageDraw, _ = _import_pil()
+    W, H = img.size
+    bar_y = 38  # starts immediately below the 38 px header
+    bar_h = _PRAI_BAR_H
+
+    draw = ImageDraw.Draw(img, "RGBA")
+    # Full-width background
+    draw.rectangle((0, bar_y, W, bar_y + bar_h), fill=(10, 13, 25, 245))
+
+    n = len(_PRAI_PHASES)
+    seg_w = W // n
+
+    num_font   = get_font(9,  bold=True)
+    label_font = get_font(12, bold=True)
+
+    for i, (num, label, accent) in enumerate(_PRAI_PHASES):
+        x0 = i * seg_w
+        x1 = (i + 1) * seg_w if i < n - 1 else W
+        is_active = (i == active_phase)
+
+        if is_active:
+            # Subtle tinted fill
+            tint = Image.new("RGBA", (x1 - x0, bar_h), (0, 0, 0, 0))
+            td = ImageDraw.Draw(tint)
+            td.rectangle(
+                (0, 0, x1 - x0, bar_h),
+                fill=(accent[0] // 5, accent[1] // 5, accent[2] // 5, 210),
+            )
+            # Left accent stripe
+            td.rectangle((0, 0, 3, bar_h), fill=accent + (255,))
+            # Bottom accent line
+            td.rectangle((0, bar_h - 2, x1 - x0, bar_h), fill=accent + (200,))
+            img.paste(tint, (x0, bar_y), tint)
+
+            text_col = accent + (255,)
+            num_col  = (accent[0], accent[1], accent[2], 170)
+        else:
+            text_col = (75, 85, 110, 255)
+            num_col  = (50, 60, 80, 255)
+
+        # Small "01" number in top-left of segment
+        draw.text((x0 + 8, bar_y + 3), num, font=num_font, fill=num_col)
+
+        # Centred phase label
+        bb  = draw.textbbox((0, 0), label, font=label_font)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        cx = x0 + (x1 - x0) // 2 - tw // 2
+        cy = bar_y + (bar_h - th) // 2
+
+        if is_active:
+            draw.text((cx + 1, cy + 1), label, font=label_font,
+                      fill=(0, 0, 0, 160))
+        draw.text((cx, cy), label, font=label_font, fill=text_col)
+
+        # Chevron separator
+        if i < n - 1:
+            cx2 = x1 - 1
+            mid = bar_y + bar_h // 2
+            draw.polygon(
+                [(cx2 - 5, bar_y + 5), (cx2 + 2, mid), (cx2 - 5, bar_y + bar_h - 5)],
+                fill=(40, 55, 80, 240),
+            )
+
+    # Bottom divider hairline
+    draw.line((0, bar_y + bar_h - 1, W, bar_y + bar_h - 1),
+              fill=(35, 50, 75, 200), width=1)
+
+
 def draw_panel(img, lines: List[Tuple[str, Tuple[int, int, int], bool]],
                anchor: str = "bottom", padding: int = 14, line_gap: int = 6,
                font_size: int = 17, label_font_size: int = 15,
-               max_chars: int = 70):
+               max_chars: int = 70, min_top: int = 44):
     """
     Draw a translucent rounded panel containing labelled text lines.
 
@@ -283,7 +376,7 @@ def draw_panel(img, lines: List[Tuple[str, Tuple[int, int, int], bool]],
         y0 = H - panel_h - 10
     else:
         y0 = 10
-    y0 = max(y0, 44)  # leave space for header
+    y0 = max(y0, min_top)  # leave space for header + PRAI bar
 
     # Translucent rounded background
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -341,13 +434,16 @@ def compose_frame(
     panel_lines: List[Tuple[str, Tuple[int, int, int], bool]],
     is_correct: Optional[bool] = None,
     accent: Tuple[int, int, int] = (96, 200, 255),
+    active_phase: int = 0,
 ) -> np.ndarray:
-    """Render header + bottom info panel onto an image frame. Returns BGR uint8."""
+    """Render header + PRAI bar + bottom info panel onto an image frame. Returns BGR uint8."""
     img = _bgr_to_pil(bgr_frame)
     header_h = draw_header(img, phase_label, sub_label, accent=accent)
+    draw_prai_bar(img, active_phase=active_phase)
+    top_offset = header_h + _PRAI_BAR_H
     if is_correct is not None:
-        draw_correctness_badge(img, is_correct, top=header_h + 6)
-    draw_panel(img, panel_lines, anchor="bottom")
+        draw_correctness_badge(img, is_correct, top=top_offset + 4)
+    draw_panel(img, panel_lines, anchor="bottom", min_top=top_offset + 6)
     return _pil_to_bgr(img)
 
 
@@ -601,11 +697,19 @@ def save_diffusion_gif(
     canvas_h: int = 384,
     fps: int = 12,
     hold_final_seconds: float = 1.5,
+    img_mean: Tuple = (0.485, 0.456, 0.406),
+    img_std: Tuple = (0.229, 0.224, 0.225),
 ):
     """
     Render the noise -> image diffusion trajectory for a single predicted
     frame as an animated GIF. Each GIF frame is annotated with the step
     progress and the diffusion time t.
+
+    img_mean / img_std must match the normalization used during training so
+    that the final snapshot (t≈1, which lives in ImageNet-normalized space)
+    is correctly converted to display colors.  Intermediate steps use
+    per-channel min-max normalization because they are a blend of noise and
+    normalized data that doesn't fit a fixed range.
     """
     cv2 = _import_cv2()
     from PIL import Image as PILImage
@@ -614,6 +718,7 @@ def save_diffusion_gif(
         return
 
     n_steps = len(snapshots)
+    last_idx = n_steps - 1
     pil_frames = []
     durations = []
     base_dur = int(1000 / fps)
@@ -621,11 +726,19 @@ def save_diffusion_gif(
     for i, (snap, t_val) in enumerate(zip(snapshots, step_times)):
         # snap: [B, F, C, H, W]
         img_t = snap[sample_idx, frame_idx]  # [C, H, W]
-        img = tensor_to_display_image(img_t)
+
+        # Final snapshot is a proper ImageNet-normalized frame — use the same
+        # unnormalization as the main video so colors are accurate.  All
+        # intermediate snapshots are noise/frame blends; min-max norm suffices.
+        if i == last_idx:
+            img = unnormalise_image(img_t, img_mean, img_std)
+        else:
+            img = tensor_to_display_image(img_t)
         img = cv2.resize(img, (canvas_w, canvas_h), interpolation=cv2.INTER_CUBIC)
 
-        progress = (i + 1) / n_steps
-        sub = f"step {i + 1}/{n_steps}    t = {t_val:.2f}"
+        # Bug-fix: first snapshot is step 0 (pure noise) → progress = 0 %
+        progress = i / max(last_idx, 1)
+        sub = f"step {i}/{last_idx}    t = {t_val:.2f}"
         panel_lines = [
             ("DiT velocity-field denoising", (200, 215, 255), False),
             (f"Progress: {int(progress * 100):3d}%", (255, 255, 255), True),
@@ -641,6 +754,7 @@ def save_diffusion_gif(
             img, phase_label="NOISE -> IMAGE",
             sub_label=sub, panel_lines=panel_lines,
             accent=accent,
+            active_phase=_PHASE_LABEL_TO_PRAI["NOISE -> IMAGE"],
         )
 
         rgb = composed[:, :, ::-1].copy()
@@ -661,6 +775,437 @@ def save_diffusion_gif(
             loop=0,
         )
         logger.info("Saved diffusion GIF -> {}", output_path)
+
+
+# ---------------------------------------------------------------------------
+# Autoregressive future-frame prediction GIF
+#
+# Visual story per frame:
+#   • "ANCHOR"  — flash the pixel context fed to context_frame_enc
+#   • "DENOISE" — Heun ODE steps: noise gradually sharpens into the frame
+#   • "REVEAL"  — predicted frame snaps onto the growing filmstrip
+#   • "GT"      — ground-truth frame slides in beside the prediction
+#
+# Each predicted frame is conditioned on the model's own previous prediction
+# (not the GT frame), mirroring predict_visual_future exactly.
+# ---------------------------------------------------------------------------
+
+# Number of denoising snapshots captured per frame.
+_AR_DENOISE_SNAPSHOTS = 14
+# Duration (ms) for the anchor flash at the start of each frame.
+_AR_ANCHOR_MS = 350
+
+
+def _heun_with_snapshots(
+    dit_rgb,
+    cond: torch.Tensor,
+    height: int,
+    width: int,
+    rgb_channels: int,
+    num_steps: int,
+    num_snapshots: int,
+    device: torch.device,
+):
+    """
+    Heun 2nd-order ODE integration that also captures intermediate frames.
+
+    Returns:
+        final: [1, rgb_channels, H, W]
+        snapshots: list of [rgb_channels, H, W] CPU tensors at selected steps
+        times: list[float] — t value for each snapshot
+    """
+    x = torch.randn(1, rgb_channels, height, width, device=device)
+    dt = 1.0 / num_steps
+
+    if num_snapshots >= num_steps + 1:
+        keep = set(range(num_steps + 1))
+    else:
+        idxs = np.linspace(0, num_steps, num_snapshots).round().astype(int)
+        keep = set(int(i) for i in idxs)
+
+    snapshots, times = [], []
+
+    def _snap(step_idx, x_now):
+        snapshots.append(x_now[0].cpu())
+        times.append(step_idx * dt)
+
+    if 0 in keep:
+        _snap(0, x)
+
+    for i in range(num_steps):
+        t_val = i * dt
+        t_next_val = min(t_val + dt, 1.0 - 1e-5)
+        t_cur = torch.full((1,), t_val, device=device)
+        t_nxt = torch.full((1,), t_next_val, device=device)
+
+        v1 = dit_rgb(x, t_cur, cond)
+        x_euler = x + v1 * dt
+        v2 = dit_rgb(x_euler, t_nxt, cond)
+        x = x + (v1 + v2) * 0.5 * dt
+
+        if (i + 1) in keep:
+            _snap(i + 1, x)
+
+    return x, snapshots, times
+
+
+def _filmstrip_bar(
+    frames_bgr: List[np.ndarray],
+    gt_frames_bgr: List[Optional[np.ndarray]],
+    strip_h: int,
+    total_w: int,
+    active_idx: int,
+    num_total: int,
+) -> np.ndarray:
+    """
+    Build a horizontal filmstrip showing observed context frames (cyan border)
+    and predicted frames generated so far (green border, gt below each).
+
+    Returns a BGR uint8 array of shape [strip_h, total_w, 3].
+    """
+    cv2 = _import_cv2()
+    bar = np.full((strip_h, total_w, 3), (14, 18, 35), dtype=np.uint8)
+
+    n = len(frames_bgr)
+    if n == 0:
+        return bar
+
+    thumb_w = min(total_w // max(num_total, 1), strip_h)
+    thumb_h = strip_h - 4  # leave a thin top/bottom margin
+
+    for i, (frame, gt) in enumerate(zip(frames_bgr, gt_frames_bgr)):
+        x0 = i * thumb_w + 2
+        if x0 + thumb_w - 2 > total_w:
+            break
+
+        thumb = cv2.resize(frame, (thumb_w - 4, thumb_h - 4),
+                           interpolation=cv2.INTER_AREA)
+        bar[2:2 + thumb_h - 4, x0 + 2:x0 + thumb_w - 2] = thumb
+
+        # Border colour: cyan for predicted (active or past), white for others
+        if i == active_idx:
+            border_col = (80, 240, 160)  # bright green — currently generating
+        elif gt is not None:
+            border_col = (80, 200, 110)  # green — already generated
+        else:
+            border_col = (96, 200, 255)  # cyan — context / observed
+
+        cv2.rectangle(bar, (x0, 2), (x0 + thumb_w - 2, strip_h - 2),
+                      border_col, 1)
+
+        # Place a small GT thumbnail in the bottom-right corner of each
+        # predicted slot so the comparison is always visible.
+        if gt is not None and i != active_idx:
+            gt_w = (thumb_w - 4) // 2
+            gt_h = (thumb_h - 4) // 2
+            gt_thumb = cv2.resize(gt, (gt_w, gt_h), interpolation=cv2.INTER_AREA)
+            gy = 2 + (thumb_h - 4) - gt_h
+            gx = x0 + 2 + (thumb_w - 4) - gt_w
+            bar[gy:gy + gt_h, gx:gx + gt_w] = gt_thumb
+            cv2.rectangle(bar, (gx - 1, gy - 1),
+                          (gx + gt_w, gy + gt_h),
+                          (255, 210, 100), 1)
+
+    return bar
+
+
+@torch.no_grad()
+def generate_autoregressive_gif(
+    model,
+    predictor,
+    visual_context_emb: torch.Tensor,
+    world_video_query_hiddens: Optional[torch.Tensor],
+    context_frames_bgr: List[np.ndarray],
+    future_frames_bgr: List[np.ndarray],
+    context_frames_tensor: torch.Tensor,
+    output_path: str,
+    canvas_w: int = 728,
+    canvas_h: int = 420,
+    num_predict: int = 4,
+    num_steps: int = 30,
+    num_denoise_snapshots: int = _AR_DENOISE_SNAPSHOTS,
+    img_mean: Tuple = (0.485, 0.456, 0.406),
+    img_std: Tuple = (0.229, 0.224, 0.225),
+    fps: int = 12,
+):
+    """
+    Produce an autoregressive future-frame prediction GIF.
+
+    For each predicted frame the GIF shows three sub-phases:
+      1. ANCHOR   — the pixel context frame fed to context_frame_enc (highlighted)
+      2. DENOISE  — Heun ODE steps: pure noise → sharp predicted RGB frame
+      3. REVEAL   — the predicted frame is added to the growing filmstrip;
+                    the matching GT frame slides in as a comparison thumbnail
+
+    Each predicted frame is conditioned on the model's own previous prediction
+    (i.e. no GT leakage at inference), exactly as ``predict_visual_future`` does.
+
+    Args:
+        model: HaloVLM instance (used for config / context_frame_enc access).
+        predictor: RGBFramePredictor — the DiT visual predictor.
+        visual_context_emb: [1, D] text/visual conditioning from forward().
+        world_video_query_hiddens: [1, n_wv, D] or None — per-frame WV queries.
+        context_frames_bgr: list of BGR uint8 np.ndarray — the observed frames.
+        future_frames_bgr: list of BGR uint8 np.ndarray — ground-truth future frames.
+        context_frames_tensor: [T, 3, H, W] normalised tensor — last frame used as
+            the initial pixel anchor for context_frame_enc.
+        output_path: destination .gif file path.
+        canvas_w / canvas_h: frame dimensions for the rendered GIF.
+        num_predict: how many future frames to generate.
+        num_steps: Heun ODE integration steps.
+        num_denoise_snapshots: denoising frames captured per predicted frame.
+        img_mean / img_std: ImageNet normalisation parameters.
+        fps: GIF playback speed.
+    """
+    cv2 = _import_cv2()
+    from PIL import Image as PILImage
+
+    device = visual_context_emb.device
+    rgb_ch = getattr(predictor.config, "rgb_channels", 3)
+    H_in = context_frames_tensor.shape[-2]
+    W_in = context_frames_tensor.shape[-1]
+
+    # ── State that evolves autoregressively ─────────────────────────────────
+    # current_past mirrors halo_vla.predict_visual_future exactly
+    current_past_tensor = context_frames_tensor.unsqueeze(0)   # [1, T, 3, H, W]
+    filmstrip_bgr: List[np.ndarray] = list(context_frames_bgr)
+    filmstrip_gt: List[Optional[np.ndarray]] = [None] * len(context_frames_bgr)
+    predicted_bgr: List[np.ndarray] = []
+    n_ctx = len(context_frames_bgr)
+    n_total_slots = n_ctx + num_predict
+
+    strip_h = max(canvas_h // 5, 60)
+    main_h = canvas_h - strip_h - 6    # 6 px divider
+    base_dur = int(1000 / fps)
+
+    pil_frames: List = []
+    durations: List[int] = []
+
+    def _push(bgr: np.ndarray, dur_ms: int):
+        rgb = bgr[:, :, ::-1].copy()
+        pil_frames.append(PILImage.fromarray(rgb))
+        durations.append(dur_ms)
+
+    def _build_frame(
+        main_bgr: np.ndarray,
+        phase: str,
+        sub: str,
+        panel_lines: List[Tuple[str, Tuple[int, int, int], bool]],
+        accent: Tuple[int, int, int],
+        active_slot: int,
+    ) -> np.ndarray:
+        """Compose header + main image + filmstrip bar into one canvas."""
+        main_resized = cv2.resize(main_bgr, (canvas_w, main_h),
+                                  interpolation=cv2.INTER_CUBIC)
+        composed = compose_frame(
+            main_resized,
+            phase_label=phase,
+            sub_label=sub,
+            panel_lines=panel_lines,
+            accent=accent,
+            active_phase=3,  # IMAGINE
+        )
+        strip = _filmstrip_bar(
+            filmstrip_bgr, filmstrip_gt,
+            strip_h=strip_h,
+            total_w=canvas_w,
+            active_idx=active_slot,
+            num_total=n_total_slots,
+        )
+        divider = np.full((6, canvas_w, 3), (20, 30, 50), dtype=np.uint8)
+        divider[2:4, :] = (96, 200, 255)
+        return np.vstack([composed, divider, strip])
+
+    # ── 1. Show all context frames briefly ──────────────────────────────────
+    for ci, ctx_bgr in enumerate(context_frames_bgr):
+        panel = [
+            ("Autoregressive World Prediction", (160, 200, 255), True),
+            (f"Context frame {ci + 1}/{n_ctx}", (245, 245, 250), False),
+            ("Model input — no prediction yet", (150, 170, 210), False),
+        ]
+        f = _build_frame(ctx_bgr, "CONTEXT", f"frame {ci+1}/{n_ctx}",
+                         panel, (96, 200, 255), ci)
+        _push(f, 600)
+
+    # ── 2. Predict frames one at a time ─────────────────────────────────────
+    for step in range(num_predict):
+        slot_idx = n_ctx + step
+
+        # --- Recompute ctx_emb (ViT-only path for step > 0) ----------------
+        if step == 0:
+            ctx_emb = visual_context_emb  # [1, D] from full forward()
+        else:
+            ctx_emb = model.encode_visual_context_from_past_vit(current_past_tensor)
+
+        # --- Per-frame WV query token ----------------------------------------
+        wv_step = None
+        if (world_video_query_hiddens is not None
+                and step < world_video_query_hiddens.size(1)):
+            wv_step = world_video_query_hiddens[:, step:step + 1, :]  # [1,1,D]
+
+        # --- Pixel anchor: last frame in current_past -----------------------
+        context_frame = current_past_tensor[:, -1]  # [1, 3, H, W]
+        anchor_bgr = unnormalise_image(
+            context_frame[0], img_mean, img_std
+        )
+        anchor_display = cv2.resize(anchor_bgr, (canvas_w, main_h),
+                                    interpolation=cv2.INTER_CUBIC)
+
+        # Highlight the anchor: draw a glowing green border
+        border_t = 8
+        anchor_hl = anchor_display.copy()
+        anchor_hl[:border_t, :] = (80, 240, 160)
+        anchor_hl[-border_t:, :] = (80, 240, 160)
+        anchor_hl[:, :border_t] = (80, 240, 160)
+        anchor_hl[:, -border_t:] = (80, 240, 160)
+
+        # Phase A: ANCHOR flash — show what context_frame_enc will receive
+        for _ in range(3):
+            panel = [
+                (f"Predicting frame {step + 1}/{num_predict}", (130, 235, 170), True),
+                ("ANCHOR — pixel context fed to context_frame_enc", (200, 230, 180), False),
+                ("This is the model's last seen/predicted frame", (150, 180, 150), False),
+            ]
+            f = _build_frame(
+                anchor_hl, "IMAGINE", f"frame {step+1}/{num_predict} · ANCHOR",
+                panel, (80, 240, 160), slot_idx,
+            )
+            _push(f, _AR_ANCHOR_MS)
+
+        # --- Build conditioning ------------------------------------------------
+        cond = predictor._create_all_frame_contexts(
+            ctx_emb,
+            num_frames=1,
+            world_video_query_hiddens=wv_step,
+            frame_offset=step,
+            context_frames=context_frame,   # [1, 3, H, W]
+            cfg_drop_mask=None,
+        )  # [1, D]  (BF = 1*1)
+
+        # Phase B: DENOISE — Heun integration with snapshots
+        pred_tensor, snapshots, snap_times = _heun_with_snapshots(
+            predictor.dit_rgb, cond, H_in, W_in, rgb_ch,
+            num_steps=num_steps,
+            num_snapshots=num_denoise_snapshots,
+            device=device,
+        )
+
+        n_snaps = len(snapshots)
+        for si, (snap, t_val) in enumerate(zip(snapshots, snap_times)):
+            progress = si / max(n_snaps - 1, 1)
+            is_final = si == n_snaps - 1
+
+            # Use proper unnorm for the final snap, min-max for noise blends
+            if is_final:
+                snap_bgr = unnormalise_image(snap, img_mean, img_std)
+            else:
+                snap_bgr = tensor_to_display_image(snap)
+            snap_bgr = cv2.resize(snap_bgr, (canvas_w, main_h),
+                                  interpolation=cv2.INTER_CUBIC)
+
+            noise_col = (
+                int(96 + (130 - 96) * progress),
+                int(200 - (200 - 235) * progress),
+                int(255 - (255 - 170) * progress),
+            )
+            panel = [
+                (f"Predicting frame {step + 1}/{num_predict}", noise_col, True),
+                (f"Heun ODE  t = {t_val:.3f}  →  1.000", (220, 220, 255), False),
+                (f"Step {si+1}/{n_snaps}  ·  {int(progress*100)}% denoised",
+                 (180, 200, 240), False),
+            ]
+            f = _build_frame(
+                snap_bgr,
+                "NOISE → FRAME",
+                f"frame {step+1}/{num_predict} · t={t_val:.2f}",
+                panel,
+                noise_col,
+                slot_idx,
+            )
+            dur = int(base_dur * 1.4) if not is_final else 800
+            _push(f, dur)
+
+        # Phase C: REVEAL — add prediction to filmstrip, show GT side-by-side
+        pred_bgr = unnormalise_image(pred_tensor[0], img_mean, img_std)
+        pred_bgr_full = cv2.resize(pred_bgr, (canvas_w, main_h),
+                                   interpolation=cv2.INTER_CUBIC)
+        filmstrip_bgr.append(cv2.resize(pred_bgr, (strip_h, strip_h)))
+
+        gt_bgr = None
+        if step < len(future_frames_bgr):
+            gt_bgr = cv2.resize(future_frames_bgr[step], (strip_h, strip_h))
+        filmstrip_gt.append(gt_bgr)
+
+        # Split canvas: prediction left, GT right
+        half_w = canvas_w // 2
+        split = pred_bgr_full.copy()
+        if gt_bgr is not None:
+            gt_full = cv2.resize(future_frames_bgr[step], (half_w, main_h))
+            split[:, half_w:] = gt_full
+            # Draw a thin divider between the two halves
+            split[:, half_w - 1:half_w + 1] = (255, 255, 255)
+            # Label: PRED on left, GT on right
+            cv2.putText(split, "PRED", (10, 30), cv2.FONT_HERSHEY_DUPLEX,
+                        0.8, (130, 235, 170), 2, cv2.LINE_AA)
+            cv2.putText(split, "GT", (half_w + 10, 30), cv2.FONT_HERSHEY_DUPLEX,
+                        0.8, (255, 210, 100), 2, cv2.LINE_AA)
+
+        for _ in range(3):
+            panel = [
+                (f"Frame {step + 1}/{num_predict} predicted", (130, 235, 170), True),
+                ("Left: model prediction   Right: ground truth", (200, 220, 200), False),
+                ("Pixel anchor = model's own prior frame (no GT leakage)", (150, 200, 160), False),
+            ]
+            f = _build_frame(
+                split, "REVEAL",
+                f"frame {step+1}/{num_predict} · REVEAL",
+                panel, (130, 235, 170), slot_idx,
+            )
+            _push(f, 700)
+
+        # --- Feed predicted frame back as the new pixel anchor ---------------
+        # Normalise the prediction back to ImageNet space for the ViT/encoder
+        pred_norm = pred_tensor[0]  # [3, H, W]  — already in [0,1] approx
+        # Clamp and renormalize to match training distribution
+        pred_norm = pred_norm.clamp(0, 1)
+        mean_t = torch.tensor(img_mean, device=device).view(3, 1, 1)
+        std_t = torch.tensor(img_std, device=device).view(3, 1, 1)
+        pred_norm = (pred_norm - mean_t) / std_t
+        current_past_tensor = torch.cat(
+            [current_past_tensor, pred_norm.unsqueeze(0).unsqueeze(0)], dim=1
+        )
+
+    # ── 3. Final hold: full filmstrip comparison ─────────────────────────────
+    if predicted_bgr:
+        last_frame = cv2.resize(predicted_bgr[-1], (canvas_w, main_h))
+    elif context_frames_bgr:
+        last_frame = cv2.resize(context_frames_bgr[-1], (canvas_w, main_h))
+    else:
+        last_frame = np.zeros((main_h, canvas_w, 3), dtype=np.uint8)
+
+    panel = [
+        (f"Generated {num_predict} future frames", (130, 235, 170), True),
+        ("Fully autoregressive — each frame conditions on the previous prediction",
+         (200, 230, 200), False),
+        ("Green border = predicted   Inset = GT   Cyan = context input",
+         (160, 200, 180), False),
+    ]
+    f = _build_frame(
+        last_frame, "IMAGINE",
+        f"complete — {num_predict} frames",
+        panel, (130, 235, 170), n_total_slots - 1,
+    )
+    _push(f, 2500)
+
+    if pil_frames:
+        pil_frames[0].save(
+            output_path,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=durations,
+            loop=0,
+        )
+        logger.info("Saved autoregressive GIF -> {}", output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +1312,7 @@ def create_video(
         canvas = compose_frame(
             raw_frame, phase_label="CONTEXT", sub_label=sub,
             panel_lines=panel_lines, accent=(96, 200, 255),
+            active_phase=_PHASE_LABEL_TO_PRAI["CONTEXT"],
         )
         combined = _stack(canvas, reveal_up_to=0,
                           phase_label="Action (GT preview)")
@@ -798,6 +1344,7 @@ def create_video(
                 last_frame, phase_label="ANSWER", sub_label=sub,
                 panel_lines=panel_lines, is_correct=is_correct,
                 accent=(150, 220, 255),
+                active_phase=_PHASE_LABEL_TO_PRAI["ANSWER"],
             )
             combined = _stack(canvas, reveal_up_to=0,
                               phase_label="Action (GT preview)")
@@ -831,6 +1378,7 @@ def create_video(
                 sub_label=f"step {reveal} / {n_anim}",
                 panel_lines=panel_lines, is_correct=is_correct,
                 accent=(255, 180, 110),
+                active_phase=_PHASE_LABEL_TO_PRAI["ACTION"],
             )
             combined = _stack(
                 canvas,
@@ -845,6 +1393,7 @@ def create_video(
             sub_label=f"complete ({n_anim}/{n_anim})",
             panel_lines=panel_lines, is_correct=is_correct,
             accent=(255, 180, 110),
+            active_phase=_PHASE_LABEL_TO_PRAI["ACTION"],
         )
         final_combined = _stack(canvas, reveal_up_to=n_anim,
                                 phase_label="Action Trajectory")
@@ -977,7 +1526,7 @@ def main(args):
             if act_preds is not None:
                 pred_actions = act_preds[0].view(-1, act_preds.size(-1)).cpu().numpy()
 
-            # --- Diffusion intermediates for the noise -> image GIF ---
+            # --- Diffusion + autoregressive GIFs ---
             visual_predictor = getattr(model, "visual_predictor", None)
             if visual_predictor is not None:
                 try:
@@ -1004,6 +1553,52 @@ def main(args):
                 except Exception as e:
                     logger.warning("Diffusion intermediates failed: {}", e)
 
+            # --- Autoregressive world-prediction GIF ----------------------
+            if visual_predictor is not None:
+                try:
+                    _, _, vce_ar, wv_ar = model(
+                        images=imgs_in, input_ids=ids_in,
+                        attention_mask=mask_in, states=states_in,
+                    )
+                    if vce_ar is not None:
+                        n_pred_ar = visual_predictor.num_predict_frames
+                        if wv_ar is not None:
+                            n_pred_ar = min(wv_ar.size(1), n_pred_ar)
+                        n_pred_ar = max(n_pred_ar, 1)
+
+                        # Collect GT future frames from sample if available
+                        future_rgb_t = sample.get("future_frames", None)
+                        gt_future_bgr: List[np.ndarray] = []
+                        if future_rgb_t is not None and isinstance(future_rgb_t, torch.Tensor):
+                            for fi in range(min(n_pred_ar, future_rgb_t.size(0))):
+                                gt_future_bgr.append(
+                                    unnormalise_image(future_rgb_t[fi],
+                                                     ds_cfg.img_mean, ds_cfg.img_std)
+                                )
+
+                        ar_gif_path = str(
+                            out_dir / f"sample_{sample_idx:05d}_autoregressive.gif"
+                        )
+                        generate_autoregressive_gif(
+                            model=model,
+                            predictor=visual_predictor,
+                            visual_context_emb=vce_ar,
+                            world_video_query_hiddens=wv_ar,
+                            context_frames_bgr=bgr_frames,
+                            future_frames_bgr=gt_future_bgr,
+                            context_frames_tensor=images_tensor.to(device),
+                            output_path=ar_gif_path,
+                            canvas_w=args.canvas_w,
+                            canvas_h=args.canvas_h,
+                            num_predict=n_pred_ar,
+                            num_steps=args.ar_steps,
+                            img_mean=ds_cfg.img_mean,
+                            img_std=ds_cfg.img_std,
+                            fps=args.diffusion_fps,
+                        )
+                except Exception as e:
+                    logger.warning("Autoregressive GIF failed: {}", e)
+
         video_name = f"sample_{sample_idx:05d}_{n_frames}frames.mp4"
         video_path = str(out_dir / video_name)
         create_video(
@@ -1028,6 +1623,8 @@ def main(args):
                 canvas_w=args.canvas_w,
                 canvas_h=args.canvas_h,
                 fps=args.diffusion_fps,
+                img_mean=ds_cfg.img_mean,
+                img_std=ds_cfg.img_std,
             )
 
         written += 1
@@ -1076,6 +1673,10 @@ def parse_args():
                    help="Frames captured for the noise->image GIF")
     p.add_argument("--diffusion_fps", type=int, default=12,
                    help="FPS for the noise->image GIF")
+
+    # Autoregressive world-prediction GIF
+    p.add_argument("--ar_steps", type=int, default=30,
+                   help="Heun ODE steps per frame in the autoregressive GIF")
 
     # Device
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
